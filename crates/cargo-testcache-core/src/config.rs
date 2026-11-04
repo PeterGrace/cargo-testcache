@@ -1,9 +1,9 @@
 //! Runtime configuration, read from `CARGO_TESTCACHE_*` environment variables.
 //!
-//! Settings layer from lowest to highest precedence: built-in defaults, environment variables
-//! (a `.env` file is loaded into the environment first), then command-line overrides applied
-//! by the binary with the `with_*` methods. `RUST_LOG` is not read here: the binary hands it
-//! straight to the log filter.
+//! Settings layer from lowest to highest precedence: built-in defaults, the `CARGO_TESTCACHE_*`
+//! entries of a `.env` file, environment variables, then command-line overrides applied by the
+//! binary with the `with_*` methods. `RUST_LOG` is not read here: the binary hands it straight
+//! to the log filter.
 //!
 //! [`Config::from_lookup`] takes the environment as a function, so tests pass a map instead of
 //! setting process environment variables, which is `unsafe` in edition 2024 because other
@@ -12,20 +12,14 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 use crate::error::{Error, Result};
 
+/// The prefix of every variable this tool reads; `.env` entries without it are ignored.
+pub const ENV_PREFIX: &str = "CARGO_TESTCACHE_";
+
 /// Environment variable naming the log format, `text` or `json`.
 pub const LOG_FORMAT_VAR: &str = "CARGO_TESTCACHE_LOG_FORMAT";
-
-/// Environment variable giving the longest wait, in whole seconds, for the application to stop
-/// after a shutdown signal.
-pub const SHUTDOWN_TIMEOUT_VAR: &str = "CARGO_TESTCACHE_SHUTDOWN_TIMEOUT_SECS";
-
-/// The default for [`SHUTDOWN_TIMEOUT_VAR`]. Kubernetes waits 30 seconds between SIGTERM and
-/// SIGKILL, so the default stays below it.
-pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// How log lines are written to stderr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,36 +62,13 @@ impl fmt::Display for LogFormat {
 /// The application's settings.
 ///
 /// Fields are private; read them through the accessors, and build a value with
-/// [`Config::from_env`], [`Config::from_lookup`] or [`Config::default`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`Config::from_lookup`] or [`Config::default`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     log_format: LogFormat,
-    shutdown_timeout: Duration,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            log_format: LogFormat::default(),
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-        }
-    }
 }
 
 impl Config {
-    /// Reads the configuration from the process environment.
-    ///
-    /// # Returns
-    ///
-    /// The configuration, with defaults for every variable that is unset.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidConfig`], listing every variable that is set but invalid.
-    pub fn from_env() -> Result<Self> {
-        Self::from_lookup(|name| std::env::var_os(name))
-    }
-
     /// Reads the configuration through `lookup`, which returns a variable's value, or `None`
     /// when it is unset.
     ///
@@ -116,7 +87,6 @@ impl Config {
     /// # Examples
     ///
     /// ```
-    /// use std::time::Duration;
     /// use cargo_testcache_core::{Config, LogFormat};
     ///
     /// let config = Config::from_lookup(|name| match name {
@@ -125,21 +95,15 @@ impl Config {
     /// })
     /// .expect("valid configuration");
     /// assert_eq!(config.log_format(), LogFormat::Json);
-    /// assert_eq!(config.shutdown_timeout(), Duration::from_secs(25));
     /// ```
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
-        let defaults = Self::default();
         let mut problems = Vec::new();
-
         let log_format = parse_var(&lookup, LOG_FORMAT_VAR, &mut problems);
-        let shutdown_secs = parse_var::<u64>(&lookup, SHUTDOWN_TIMEOUT_VAR, &mut problems);
-
         if !problems.is_empty() {
             return Err(Error::InvalidConfig { problems });
         }
         Ok(Self {
-            log_format: log_format.unwrap_or(defaults.log_format),
-            shutdown_timeout: shutdown_secs.map_or(defaults.shutdown_timeout, Duration::from_secs),
+            log_format: log_format.unwrap_or_default(),
         })
     }
 
@@ -161,11 +125,6 @@ impl Config {
     /// How log lines are written.
     pub fn log_format(&self) -> LogFormat {
         self.log_format
-    }
-
-    /// The longest wait for the application to stop after a shutdown signal.
-    pub fn shutdown_timeout(&self) -> Duration {
-        self.shutdown_timeout
     }
 }
 
@@ -228,48 +187,35 @@ mod tests {
         assert_eq!(parsed, format);
     }
 
-    // Property: each variable that is set is used, and each one that is unset gets its default.
+    // Property: a set variable is used, and an unset one gets the default.
     #[hegel::test]
     fn valid_values_are_read_and_unset_ones_default(tc: TestCase) {
         let format = tc.draw(gs::optional(
             gs::sampled_from(&[LogFormat::Text, LogFormat::Json]).print_as_debug(),
         ));
-        let timeout_secs = tc.draw(gs::optional(gs::integers::<u64>()));
         let mut vars = HashMap::new();
         if let Some(format) = format {
             vars.insert(LOG_FORMAT_VAR, format.to_string());
-        }
-        if let Some(secs) = timeout_secs {
-            vars.insert(SHUTDOWN_TIMEOUT_VAR, secs.to_string());
         }
 
         let config = Config::from_lookup(lookup_in(&vars)).expect("valid values are accepted");
 
         assert_eq!(config.log_format(), format.unwrap_or_default());
-        assert_eq!(
-            config.shutdown_timeout(),
-            timeout_secs.map_or(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_secs)
-        );
     }
 
-    // Property: every invalid variable is reported, not only the first one found.
+    // Property: an invalid value is reported under its variable's name.
     #[hegel::test]
-    fn every_invalid_value_is_reported(tc: TestCase) {
+    fn an_invalid_value_is_reported(tc: TestCase) {
         let format = tc.draw(gs::text().filter(|text: &String| text.parse::<LogFormat>().is_err()));
-        let timeout = tc.draw(gs::text().filter(|text: &String| text.parse::<u64>().is_err()));
-        let vars = HashMap::from([(LOG_FORMAT_VAR, format), (SHUTDOWN_TIMEOUT_VAR, timeout)]);
+        let vars = HashMap::from([(LOG_FORMAT_VAR, format)]);
 
         let error = Config::from_lookup(lookup_in(&vars)).expect_err("invalid values are refused");
 
         let Error::InvalidConfig { problems } = error else {
             panic!("expected InvalidConfig, got {error:?}");
         };
-        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].starts_with(LOG_FORMAT_VAR), "{problems:?}");
-        assert!(
-            problems[1].starts_with(SHUTDOWN_TIMEOUT_VAR),
-            "{problems:?}"
-        );
     }
 
     // Property: a command-line override wins over whatever the environment set.

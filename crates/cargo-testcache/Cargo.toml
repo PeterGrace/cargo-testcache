@@ -1,6 +1,6 @@
 [package]
 name = "cargo-testcache"
-description = "cargo-testcache"
+description = "Runs cargo test, skipping test binaries that already passed with the same inputs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,21 +11,14 @@ publish.workspace = true
 cargo-testcache-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-console-subscriber = { workspace = true, optional = true }
 dotenvy.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 hegeltest.workspace = true
-nix.workspace = true
-
-[features]
-# Serves task data to `tokio-console`. Run it with `just run-tokio-console`, which also sets
-# `--cfg tokio_unstable` (needed for tokio's task instrumentation) for that build only, so
-# ordinary builds keep their cache and never bind the console's port (6669).
-tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+tempfile.workspace = true
+walkdir.workspace = true
 
 [lints]
 workspace = true

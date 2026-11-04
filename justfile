@@ -22,10 +22,6 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Lint the binary with its `tokio-console` feature, which ordinary `clippy` never builds.
-clippy-tokio-console:
-    RUSTFLAGS="--cfg tokio_unstable" cargo clippy -p cargo-testcache --features tokio-console --all-targets -- -D warnings
-
 # Run the dylint lint libraries pinned in `[workspace.metadata.dylint]` (Cargo.toml).
 dylint:
     #!/usr/bin/env bash
@@ -126,10 +122,6 @@ gate: lint test hegel-canary doc
 # Run the binary; arguments pass through (`just run --help`).
 run *args:
     cargo run -p cargo-testcache -- "$@"
-
-# Run with tokio-console support; connect with `tokio-console` (default port 6669).
-run-tokio-console *args:
-    RUSTFLAGS="--cfg tokio_unstable" cargo run -p cargo-testcache --features tokio-console -- "$@"
 
 # Bump the version (`patch`, `minor` or `major`), commit and tag it locally. Run on a clean,
 # up-to-date main; `release-ship` publishes it.

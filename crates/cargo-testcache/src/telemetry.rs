@@ -44,14 +44,7 @@ pub fn init(format: LogFormat) {
         LogFormat::Json => format_layer.json().boxed(),
     };
 
-    let registry = Registry::default();
-    // `#[cfg(...)]` compiles the next statement only with the `tokio-console` feature, so
-    // ordinary builds never include console-subscriber or bind its port.
-    #[cfg(feature = "tokio-console")]
-    let registry = registry.with(console_subscriber::spawn());
-
-    // The filter is attached to the format layer only, so tokio-console still sees every span.
-    let subscriber = registry.with(format_layer.with_filter(filter));
+    let subscriber = Registry::default().with(format_layer.with_filter(filter));
     tracing::subscriber::set_global_default(subscriber)
         .expect("telemetry::init is called once, before anything else installs a subscriber");
 }

@@ -12,7 +12,6 @@ ones:
 | `just fmt` | Format the workspace |
 | `just deny` | Audit dependencies (needs `cargo-deny`) |
 | `just coverage` | Test coverage summary (needs `cargo-llvm-cov`) |
-| `just run-tokio-console` | Run with [tokio-console](https://github.com/tokio-rs/console) support |
 | `just release-prepare patch` | Bump, commit and tag a release (needs `cargo-release`) |
 | `just release-ship` | Publish the prepared release |
 

@@ -44,7 +44,6 @@ jobs:
       - run: cargo fetch --locked
       - run: just fmt-check
       - run: just clippy
-      - run: just clippy-tokio-console
       - run: just doc
 
   # `cargo-dylint` and `dylint-link` must match the trailofbits tag in Cargo.toml's

@@ -29,7 +29,7 @@ Changelog entries **MUST** use this format, and nothing else:
 - Shared dependency versions, lints and metadata live in the root `Cargo.toml` (`[workspace.dependencies]`, `[workspace.lints]`); member crates opt in with `<key>.workspace = true` and `[lints] workspace = true`.
 - Configuration comes from defaults, then `CARGO_TESTCACHE_*` environment variables (and `.env`), then command-line flags. Document every variable in `.env.example`.
 - Logs go to stderr, so stdout stays clean for data. Set the filter with `RUST_LOG`.
-- `just` runs every routine task (`just` lists them); CI calls the same recipes. Use `just run-tokio-console` for tokio-console: it sets `--cfg tokio_unstable` for that build only.
+- `just` runs every routine task (`just` lists them); CI calls the same recipes.
 - Design specs go in `docs/superpowers/specs/YYYY-MM-DD-<slug>-design.md` and implementation plans in `docs/superpowers/plans/YYYY-MM-DD-<slug>.md`.
 
 ## Preferred Tools

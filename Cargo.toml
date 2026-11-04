@@ -12,9 +12,9 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# Minimum supported Rust version, checked by `just msrv`. Edition 2024 needs 1.85; `if let`
-# chains (used in main.rs) need 1.88.
-rust-version = "1.88"
+# Minimum supported Rust version, checked by `just msrv`. `std::fs::File::lock` (the store's
+# lock) needs 1.89.
+rust-version = "1.89"
 authors = ["Peter Grace <pete.grace@gmail.com>"]
 publish = false
 
@@ -27,32 +27,37 @@ anyhow = "1.0.104"
 # Command-line parsing. `derive` gives `#[derive(Parser)]`; `env` lets an `#[arg]` fall back to
 # an environment variable.
 clap = { version = "4.6.7", features = ["derive", "env"] }
-# tokio-console support, only behind the binary's `tokio-console` feature.
-console-subscriber = "0.5.0"
-# Loads `.env` into the environment at startup. `dotenvy` is the maintained fork of `dotenv`.
+# Reads `.env` without loading it into the process (see `load_config` in main.rs).
 dotenvy = "0.15.7"
-# Wrapper types that keep secrets out of `Debug` output and logs. Not used by the skeleton;
-# here so every crate that needs it shares one version.
+# Glob matching for `inputs` and `always_run`.
+globset = "0.4.21"
+# Hex encoding of digests in the store; `serde` adds `hex::serde` for `#[serde(with = ...)]`.
+hex = { version = "0.4.3", features = ["serde"] }
+# Progress bar on stderr while hashing and running.
+indicatif = "0.18.6"
+# Data parallelism for hashing executables and input files.
+rayon = "1.12.0"
+# Wrapper types that keep secrets out of `Debug` output and logs. Not used yet; here so every
+# crate that needs it shares one version.
 secrecy = "0.10.3"
-# Serialization, likewise shared but not used by the skeleton.
+# The store's JSON lines and Cargo's JSON output.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# SHA-256 for every digest in a cache key.
+sha2 = "0.11.1"
 # Library error enums (`#[derive(Error)]`).
 thiserror = "2.0.21"
-# Async runtime. Features are declared rather than left to feature unification: `rt-multi-thread`
-# and `macros` for `#[tokio::main]`, `signal` for SIGTERM/SIGINT, `sync` for the shutdown
-# channel, `time` for the bounded drain.
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing = "0.1.44"
 # `json` adds the JSON log format; `env-filter` reads `RUST_LOG`.
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
+# Walking the workspace for input files.
+walkdir = "2.5.0"
 
 # Hegel property-based testing. Published as `hegeltest`, imported as `hegel`. `static-engine`
 # links the engine into the test binary instead of downloading it at test time.
 hegeltest = { version = "0.52.0", features = ["static-engine"] }
-
-# Raising real signals in the shutdown tests.
-nix = { version = "0.31.3", features = ["signal"] }
+# Temporary directories for store and fixture tests.
+tempfile = "3.27.0"
 
 [workspace.lints.rust]
 # Every public item needs a doc comment; `-D warnings` in CI turns this into an error.

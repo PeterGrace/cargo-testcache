@@ -59,6 +59,12 @@ pub struct SplitArgs {
 /// # Returns
 ///
 /// The three groups, each in its original order.
+///
+/// # Limits
+///
+/// The values of Cargo's own options are not consumed, so a Cargo value spelled exactly like one
+/// of the tool's flags is taken as the tool's. Clustered short options (`-hV`) are not taken
+/// apart and go to Cargo. An argument that is not valid UTF-8 always goes to Cargo.
 pub fn split(
     args: impl IntoIterator<Item = OsString>,
     subcommands: &[&str],
@@ -89,7 +95,10 @@ pub fn split(
                 let needs_value = arity == Arity::Value && !text.is_some_and(|t| t.contains('='));
                 split.own.push(arg);
                 if needs_value {
-                    split.own.extend(args.next());
+                    // Leave `--` for the separator branch, so clap reports the missing value.
+                    split
+                        .own
+                        .extend(args.next_if(|next| next.as_os_str() != "--"));
                 }
             }
             None => split.cargo.0.push(arg),
@@ -108,19 +117,44 @@ fn option_name(arg: &str) -> Option<&str> {
 }
 
 /// The value attached to `arg` for `flag`: `v` from `--flag=v`, or from `-pv` for a short flag.
-fn attached_value<'a>(arg: &'a str, flag: &str) -> Option<&'a str> {
-    let rest = arg.strip_prefix(flag)?;
-    if let Some(value) = rest.strip_prefix('=') {
-        return Some(value);
+///
+/// Flags are matched on the argument's bytes, so an argument that is not valid UTF-8 is still
+/// recognized; only the value may be non-UTF-8.
+#[cfg(unix)]
+fn attached_value<'a>(arg: &'a OsStr, flag: &str) -> Option<&'a OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let rest = arg.as_bytes().strip_prefix(flag.as_bytes())?;
+    if let Some(value) = rest.strip_prefix(b"=") {
+        return Some(OsStr::from_bytes(value));
     }
     let is_short = flag.len() == 2;
-    (is_short && !rest.is_empty()).then_some(rest)
+    (is_short && !rest.is_empty()).then(|| OsStr::from_bytes(rest))
+}
+
+/// The value attached to `arg` for `flag`: `v` from `--flag=v`, or from `-pv` for a short flag.
+///
+/// Without a safe way to cut an `OsStr` at a byte, an argument that is not valid UTF-8 is
+/// ignored with a warning.
+#[cfg(not(unix))]
+fn attached_value<'a>(arg: &'a OsStr, flag: &str) -> Option<&'a OsStr> {
+    let Some(text) = arg.to_str() else {
+        if arg.as_encoded_bytes().starts_with(flag.as_bytes()) {
+            tracing::warn!("ignoring non-UTF-8 value of {flag}");
+        }
+        return None;
+    };
+    let rest = text.strip_prefix(flag)?;
+    if let Some(value) = rest.strip_prefix('=') {
+        return Some(OsStr::new(value));
+    }
+    let is_short = flag.len() == 2;
+    (is_short && !rest.is_empty()).then(|| OsStr::new(rest))
 }
 
 /// Whether `arg` is `flag`, alone or with an attached value.
 fn is_flag(arg: &OsStr, flag: &str) -> bool {
-    arg.to_str()
-        .is_some_and(|text| text == flag || attached_value(text, flag).is_some())
+    arg == flag || attached_value(arg, flag).is_some()
 }
 
 /// The arguments for `cargo test`.
@@ -142,6 +176,10 @@ impl CargoArgs {
     }
 
     /// The arguments, in order.
+    ///
+    /// # Returns
+    ///
+    /// The arguments as a slice.
     pub fn as_slice(&self) -> &[OsString] {
         &self.0
     }
@@ -172,27 +210,38 @@ impl CargoArgs {
         let mut found = None;
         let mut iter = self.0.iter();
         while let Some(arg) = iter.next() {
-            let Some(text) = arg.to_str() else { continue };
-            if text == flag {
+            if arg == flag {
                 found = iter.next().map(OsString::as_os_str);
-            } else if let Some(value) = attached_value(text, flag) {
-                found = Some(OsStr::new(value));
+            } else if let Some(value) = attached_value(arg, flag) {
+                found = Some(value);
             }
         }
         found
     }
 
     /// The first argument that makes `cargo test` run unchanged (`--no-run`, `--doc`).
+    ///
+    /// # Returns
+    ///
+    /// The flag, or `None` when none is given.
     pub fn passthrough_flag(&self) -> Option<&'static str> {
         PASSTHROUGH.into_iter().find(|flag| self.has(flag))
     }
 
     /// The first argument this tool refuses (`--message-format`).
+    ///
+    /// # Returns
+    ///
+    /// The flag, or `None` when none is given.
     pub fn unsupported_flag(&self) -> Option<&'static str> {
         UNSUPPORTED.into_iter().find(|flag| self.has(flag))
     }
 
     /// Whether the arguments select targets, which turns doc tests off in `cargo test`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any target selection argument is given.
     pub fn selects_targets(&self) -> bool {
         TARGET_SELECTION
             .into_iter()
@@ -217,22 +266,21 @@ impl CargoArgs {
         let mut kept = Vec::with_capacity(self.0.len());
         let mut iter = self.0.iter();
         while let Some(arg) = iter.next() {
-            if let Some(text) = arg.to_str() {
-                if with_value().any(|flag| text == flag) {
-                    iter.next();
-                    continue;
-                }
-                if with_value().any(|flag| attached_value(text, flag).is_some())
-                    || switches().any(|flag| text == flag)
-                {
-                    continue;
-                }
+            if with_value().any(|flag| arg == flag) {
+                iter.next();
+                continue;
+            }
+            if with_value().any(|flag| attached_value(arg, flag).is_some())
+                || switches().any(|flag| arg == flag)
+            {
+                continue;
             }
             kept.push(arg.clone());
         }
         Self(kept)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,20 +406,36 @@ mod tests {
         );
     }
 
-    const SELECTION: [&[&str]; 7] = [
-        &["-p", "x"],
-        &["-px"],
-        &["--package=x"],
-        &["--workspace"],
-        &["--test", "t"],
-        &["--lib"],
-        &["--exclude", "y"],
+    /// Package and target selection arguments, each with a value where one is needed, and
+    /// whether the piece selects targets. `--tests`/`--test`, `--bins`/`--bin` and
+    /// `--all`/`--all-targets` are the near-miss look-alikes.
+    const SELECTION: [(&[&str], bool); 19] = [
+        (&["-p", "x"], false),
+        (&["-px"], false),
+        (&["--package", "x"], false),
+        (&["--package=x"], false),
+        (&["--exclude", "y"], false),
+        (&["--exclude=y"], false),
+        (&["--workspace"], false),
+        (&["--all"], false),
+        (&["--test", "t"], true),
+        (&["--test=t"], true),
+        (&["--bin", "b"], true),
+        (&["--example", "e"], true),
+        (&["--bench", "b"], true),
+        (&["--lib"], true),
+        (&["--bins"], true),
+        (&["--examples"], true),
+        (&["--tests"], true),
+        (&["--benches"], true),
+        (&["--all-targets"], true),
     ];
-    const OTHER: [&[&str]; 4] = [
+    const OTHER: [&[&str]; 5] = [
         &["--release"],
         &["--features", "f"],
         &["-j", "4"],
         &["--locked"],
+        &["--all-features"],
     ];
 
     // Property: `without_selection` drops exactly the package and target selection arguments,
@@ -381,17 +445,17 @@ mod tests {
         let pieces = tc.draw(
             gs::vecs(gs::tuples!(
                 gs::booleans(),
-                gs::integers::<usize>().max_value(6)
+                gs::integers::<usize>().max_value(SELECTION.len() - 1)
             ))
-            .max_size(6),
+            .max_size(8),
         );
         let mut args = Vec::new();
         let mut kept = Vec::new();
         let mut targets = false;
         for (selection, index) in pieces {
             if selection {
-                let piece = SELECTION[index];
-                targets |= piece[0] == "--test" || piece[0] == "--lib";
+                let (piece, selects) = SELECTION[index];
+                targets |= selects;
                 args.extend(os(piece));
             } else {
                 let piece = OTHER[index % OTHER.len()];
@@ -403,5 +467,53 @@ mod tests {
 
         assert_eq!(cargo.without_selection().as_slice(), kept.as_slice());
         assert_eq!(cargo.selects_targets(), targets);
+    }
+
+    // Property: an own option that takes a value never takes the `--` separator as its value.
+    #[hegel::test]
+    fn value_options_leave_the_separator_alone(tc: TestCase) {
+        let test = tc.draw(
+            gs::vecs(gs::sampled_from(&["filter", "--explain"]).print_as_debug()).max_size(3),
+        );
+        let mut argv = vec!["--log-format", "--"];
+        argv.extend_from_slice(&test);
+
+        let split = split(os(&argv), &[], classify);
+
+        assert_eq!(split.own, os(&["--log-format"]));
+        assert_eq!(split.test, os(&test));
+    }
+
+    // Property: an argument that is not UTF-8 goes to cargo unchanged, and flags with a
+    // non-UTF-8 attached value are still found, read and removed.
+    #[cfg(unix)]
+    #[hegel::test]
+    fn non_utf8_arguments_are_handled_bytewise(tc: TestCase) {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(6));
+        // 0xFF never occurs in UTF-8, so the argument cannot be valid text.
+        bytes.push(0xFF);
+        let arbitrary = OsString::from_vec([b"x".as_slice(), &bytes].concat());
+        let mut package = b"--package=".to_vec();
+        package.extend_from_slice(&bytes);
+        let package = OsString::from_vec(package);
+        let mut target_dir = b"--target-dir=".to_vec();
+        target_dir.extend_from_slice(&bytes);
+        let target_dir = OsString::from_vec(target_dir);
+
+        let split = split([arbitrary.clone()], &[], classify);
+        let cargo = CargoArgs::new(vec![package.clone(), target_dir.clone(), arbitrary.clone()]);
+
+        assert_eq!(split.cargo.as_slice(), [arbitrary.clone()].as_slice());
+        assert!(cargo.has("--package"));
+        assert_eq!(
+            cargo.value("--target-dir"),
+            Some(OsString::from_vec(bytes).as_os_str())
+        );
+        assert_eq!(
+            cargo.without_selection().as_slice(),
+            [target_dir, arbitrary].as_slice()
+        );
     }
 }

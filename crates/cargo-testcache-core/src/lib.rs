@@ -2,8 +2,9 @@
 //!
 //! The `cargo-testcache` binary only splits the command line, sets up logging and maps the
 //! outcome to an exit status; everything else lives here, so tests and other crates can call it
-//! without spawning a process. `app::run` (added by a later task) is the entry point.
+//! without spawning a process. [`app::run`] is the entry point.
 
+pub mod app;
 pub mod args;
 pub mod config;
 pub mod discover;

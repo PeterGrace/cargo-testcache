@@ -86,7 +86,7 @@ pub fn glob(pattern: &str) -> Result<Glob> {
         .build()
         .map_err(|source| Error::InvalidGlob {
             pattern: pattern.to_owned(),
-            source,
+            reason: source.to_string(),
         })
 }
 
@@ -119,7 +119,7 @@ impl AlwaysRun {
             .map_err(|source| Error::InvalidGlob {
                 // `build` fails only on whole-set limits, so no single user pattern is to blame.
                 pattern: "the always_run patterns together".to_owned(),
-                source,
+                reason: source.to_string(),
             })
     }
 

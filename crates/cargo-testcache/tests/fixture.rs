@@ -424,6 +424,58 @@ fn via_cargo_records_only_the_binary_it_hashed(tc: TestCase) {
     }
 }
 
+// Property: a package's `inputs` glob may reach outside the package with `..` and spell its
+// directories with `./`, and still covers the files it names: with only alpha's table naming
+// `data/`, changing `data/value.txt` reruns alpha's binaries and no other, and so does changing
+// alpha's fixture. Every spelling is checked in every case, in turn on one fixture, in a drawn
+// order. A glob that matches no file is warned about.
+#[hegel::test(test_cases = 2)]
+fn package_inputs_may_climb_out_of_the_package(tc: TestCase) {
+    let rotation = tc.draw(gs::integers::<usize>().max_value(2));
+    let stamp = tc.draw(gs::integers::<u32>());
+    let fixture = Fixture::new();
+    fixture.replace("Cargo.toml", "inputs = [\"data/**\"]", "inputs = []");
+    let mut spellings = [
+        ["../data/**", "./fixtures/**"],
+        ["./../data/**", "fixtures/**"],
+        ["../alpha/../data/**", "fixtures/./**"],
+    ];
+    spellings.rotate_left(rotation);
+    let mut table = "inputs = [\"fixtures/**\"]".to_owned();
+    for (index, spelling) in spellings.iter().enumerate() {
+        let next = format!("inputs = [\"{}\", \"{}\"]", spelling[0], spelling[1]);
+        fixture.replace("alpha/Cargo.toml", &table, &next);
+        table = next;
+        let settled = fixture.testcache_ok(&[]);
+        assert!(
+            !stderr(&settled).contains("matched no file"),
+            "{spelling:?}: {}",
+            stderr(&settled)
+        );
+        fixture.take_runs();
+
+        for file in ["data/value.txt", "alpha/fixtures/extra.txt"] {
+            fixture.write(file, &format!("{stamp}-{index}"));
+            fixture.testcache_ok(&[]);
+            assert_eq!(
+                fixture.take_runs(),
+                names(&["alpha", "reads_input"]),
+                "{spelling:?}, after changing {file}"
+            );
+        }
+    }
+    // A glob that matches nothing is warned about, naming its table.
+    fixture.replace("alpha/Cargo.toml", &table, "inputs = [\"nothing/**\"]");
+    let output = fixture.testcache_ok(&[]);
+    assert!(
+        stderr(&output).contains(
+            "inputs glob \"nothing/**\" in [package.metadata.testcache] of `alpha` matched no file"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
 // Property (9.4): a failing binary is not recorded, so it runs again, and a passing one is, so
 // it does not. Every binary starts out failing and is fixed one at a time, in a drawn order:
 // each run then runs exactly the binaries that have not passed yet.

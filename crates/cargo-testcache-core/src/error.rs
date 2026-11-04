@@ -74,14 +74,13 @@ pub enum Error {
         message: String,
     },
 
-    /// A glob in the configuration does not compile.
-    #[error("invalid glob {pattern:?}: {source}")]
+    /// A glob in the configuration does not compile, or can never match.
+    #[error("invalid glob {pattern:?}: {reason}")]
     InvalidGlob {
         /// The pattern as written.
         pattern: String,
-        /// The compiler's error.
-        #[source]
-        source: globset::Error,
+        /// The glob compiler's error, or why the glob can never match.
+        reason: String,
     },
 
     /// A `cargo test` argument this tool cannot honour.

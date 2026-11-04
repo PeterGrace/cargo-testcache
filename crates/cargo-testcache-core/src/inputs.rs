@@ -7,6 +7,12 @@
 //! that no glob's literal prefix leads to. Symlinked files and directories are followed, as a
 //! test reading them would follow them; directories are compared to the target and build
 //! directories by canonical path, because Cargo does not normalize the paths it reports.
+//!
+//! Before compiling, each glob's literal directories (those before its first wildcard) are
+//! normalized: `.` is dropped and `..` resolved against the declaring package's directory, so
+//! `../shared/**` in `crates/a` becomes `crates/shared/**`. A glob that would climb above the
+//! workspace root, an absolute glob, and `..` after a wildcard are refused, since none of them
+//! can ever match a walked file. A glob that matches no file is warned about once per run.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,11 +34,23 @@ enum Owner {
     Package(usize),
 }
 
+/// Why a glob is refused when it reaches outside the workspace.
+const OUTSIDE_WORKSPACE: &str = "inputs must be inside the workspace root, relative to the \
+    package or workspace that declares them";
+
+/// Why a glob is refused when `..` follows a wildcard.
+const PARENT_AFTER_WILDCARD: &str = "`..` is only resolved before the first wildcard";
+
+/// Characters that make a glob component a pattern rather than a literal name.
+const WILDCARDS: [char; 5] = ['*', '?', '[', '{', '\\'];
+
 /// One package's `inputs`, for [`InputPatterns::from_parts`].
 #[derive(Debug, Clone)]
 pub struct PackageGlobs<'a> {
     /// The package id.
     pub id: &'a str,
+    /// The package name, for messages.
+    pub name: &'a str,
     /// The package directory relative to the workspace root, with `/` separators; `None` when
     /// it is outside the root.
     pub dir: Option<String>,
@@ -53,6 +71,8 @@ pub struct InputPatterns {
     /// For each glob, the directory components before its first wildcard. An empty prefix means
     /// the glob can match anywhere.
     prefixes: Vec<Vec<String>>,
+    /// For each glob, how it was written and the table that declares it, for messages.
+    declared: Vec<(String, String)>,
 }
 
 impl InputPatterns {
@@ -72,6 +92,7 @@ impl InputPatterns {
     pub fn new(workspace: &Workspace) -> Result<Self> {
         let packages = workspace.packages().map(|(id, package)| PackageGlobs {
             id,
+            name: package.name(),
             dir: package
                 .root()
                 .strip_prefix(workspace.root())
@@ -95,7 +116,8 @@ impl InputPatterns {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidGlob`] when a glob does not compile.
+    /// [`Error::InvalidGlob`] when a glob does not compile, is absolute, climbs above the
+    /// workspace root, or has `..` after a wildcard.
     pub fn from_parts<'a>(
         workspace_globs: &[String],
         packages: impl IntoIterator<Item = PackageGlobs<'a>>,
@@ -105,10 +127,24 @@ impl InputPatterns {
         let mut package_index = HashMap::new();
         let mut outside = HashSet::new();
         let mut prefixes = Vec::new();
+        let mut declared = Vec::new();
+        // One closure adds a glob for either kind of table. It borrows the collections above
+        // mutably until its last use, so they are moved into `Self` only after that.
+        let mut add = |dir: &[&str], pattern: &str, owner: Owner, table: &str| -> Result<()> {
+            let rooted = root_glob(dir, pattern)?;
+            builder.add(glob(&rooted.glob)?);
+            owners.push(owner);
+            prefixes.push(rooted.prefix);
+            declared.push((pattern.to_owned(), table.to_owned()));
+            Ok(())
+        };
         for pattern in workspace_globs {
-            builder.add(glob(pattern)?);
-            owners.push(Owner::Workspace);
-            prefixes.push(literal_prefix(&[], pattern));
+            add(
+                &[],
+                pattern,
+                Owner::Workspace,
+                "[workspace.metadata.testcache]",
+            )?;
         }
         for (index, package) in packages.into_iter().enumerate() {
             if package.globs.is_empty() {
@@ -121,23 +157,14 @@ impl InputPatterns {
             };
             let dir_components: Vec<&str> =
                 dir.split('/').filter(|part| !part.is_empty()).collect();
-            // `escape` makes a directory such as `we[i]rd` match itself literally; it leaves
-            // `\` alone, which our globs treat as an escape, so that is wrapped in a class.
-            let escaped_dir = globset::escape(&dir).replace('\\', "[\\]");
+            let table = format!("[package.metadata.testcache] of `{}`", package.name);
             for pattern in package.globs {
-                let rooted = if dir.is_empty() {
-                    pattern.clone()
-                } else {
-                    format!("{escaped_dir}/{pattern}")
-                };
-                builder.add(glob(&rooted)?);
-                owners.push(Owner::Package(index));
-                prefixes.push(literal_prefix(&dir_components, pattern));
+                add(&dir_components, pattern, Owner::Package(index), &table)?;
             }
         }
         let set = builder.build().map_err(|source| Error::InvalidGlob {
             pattern: "inputs".to_owned(),
-            source,
+            reason: source.to_string(),
         })?;
         Ok(Self {
             set,
@@ -145,6 +172,7 @@ impl InputPatterns {
             package_index,
             outside,
             prefixes,
+            declared,
         })
     }
 
@@ -171,17 +199,109 @@ impl InputPatterns {
     }
 
     /// The owners of the globs a workspace-relative path matches, sorted, without repeats.
+    #[cfg(test)]
     fn owners_of(&self, relative: &str) -> Vec<Owner> {
-        let mut owners: Vec<Owner> = self
-            .set
-            .matches(relative)
-            .into_iter()
-            .map(|index| self.owners[index])
-            .collect();
+        self.owners_of_globs(&self.set.matches(relative))
+    }
+
+    /// The owners of the globs at these indices, sorted, without repeats.
+    fn owners_of_globs(&self, globs: &[usize]) -> Vec<Owner> {
+        let mut owners: Vec<Owner> = globs.iter().map(|index| self.owners[*index]).collect();
         owners.sort_unstable();
         owners.dedup();
         owners
     }
+
+    /// Warns once for each glob that matched no file.
+    ///
+    /// # Arguments
+    ///
+    /// * `matched` - Whether each glob, by index, matched a file.
+    fn warn_unmatched(&self, matched: &[bool]) {
+        for ((pattern, table), _) in self
+            .declared
+            .iter()
+            .zip(matched)
+            .filter(|(_, matched)| !**matched)
+        {
+            tracing::warn!("inputs glob {pattern:?} in {table} matched no file");
+        }
+    }
+}
+
+/// A glob made relative to the workspace root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootedGlob {
+    /// The glob, its literal directories escaped.
+    glob: String,
+    /// Its literal components before the first wildcard, normalized.
+    prefix: Vec<String>,
+}
+
+/// Roots a glob at its table's directory and normalizes its literal part.
+///
+/// # Arguments
+///
+/// * `dir` - The declaring package's directory components, relative to the workspace root;
+///   empty for the workspace's own table.
+/// * `pattern` - The glob as written, relative to that directory.
+///
+/// # Returns
+///
+/// The glob relative to the workspace root: `.` components before the first wildcard are
+/// dropped, and each `..` there removes the component before it.
+///
+/// # Errors
+///
+/// [`Error::InvalidGlob`] when the glob is absolute, climbs above the workspace root, or has
+/// `..` after its first wildcard.
+fn root_glob(dir: &[&str], pattern: &str) -> Result<RootedGlob> {
+    let invalid = |reason: &str| Error::InvalidGlob {
+        pattern: pattern.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let as_path = Path::new(pattern);
+    if pattern.starts_with('/') || as_path.has_root() || as_path.is_absolute() {
+        return Err(invalid(OUTSIDE_WORKSPACE));
+    }
+    let mut prefix: Vec<String> = dir.iter().map(|part| (*part).to_owned()).collect();
+    let mut components = pattern.split('/');
+    let mut rest = Vec::new();
+    // `by_ref` borrows the iterator, so the loop can stop at the first wildcard and the
+    // remaining components are still there for `extend` below.
+    for component in components.by_ref() {
+        if component.contains(WILDCARDS) {
+            rest.push(component);
+            break;
+        }
+        match component {
+            "" | "." => {}
+            ".." => {
+                if prefix.pop().is_none() {
+                    return Err(invalid(OUTSIDE_WORKSPACE));
+                }
+            }
+            name => prefix.push(name.to_owned()),
+        }
+    }
+    rest.extend(components);
+    if rest.contains(&"..") {
+        return Err(invalid(PARENT_AFTER_WILDCARD));
+    }
+    let glob = prefix
+        .iter()
+        .map(|part| escape_literal(part))
+        .chain(rest.iter().map(|part| (*part).to_owned()))
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(RootedGlob { glob, prefix })
+}
+
+/// A literal name as a glob that matches only itself. `globset::escape` makes a name such as
+/// `we[i]rd` literal; it leaves `\` alone, which these globs treat as an escape, so that is
+/// wrapped in a class.
+fn escape_literal(name: &str) -> String {
+    globset::escape(name).replace('\\', "[\\]")
 }
 
 /// One matched file.
@@ -304,7 +424,8 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
 fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found> {
     let root = canonical_or_raw(workspace.root());
     let skipped = SkippedDirs::new([workspace.target_dir(), workspace.build_dir()]);
-    WalkDir::new(&root)
+    let mut matched = vec![false; patterns.owners.len()];
+    let found = WalkDir::new(&root)
         .follow_links(true)
         .into_iter()
         // `filter_entry` stops the walk from descending into the directories it rejects.
@@ -334,19 +455,24 @@ fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found>
         .filter_map(|entry| {
             let relative_path = entry.path().strip_prefix(&root).ok()?;
             let relative = slash_path(relative_path);
-            let owners = patterns.owners_of(&relative);
-            if owners.is_empty() {
+            let globs = patterns.set.matches(&relative);
+            if globs.is_empty() {
                 return None;
+            }
+            for index in &globs {
+                matched[*index] = true;
             }
             let utf8 = relative_path.to_str().is_some();
             Some(Found {
                 utf8,
+                owners: patterns.owners_of_globs(&globs),
                 relative,
-                owners,
                 path: entry.into_path(),
             })
         })
-        .collect()
+        .collect();
+    patterns.warn_unmatched(&matched);
+    found
 }
 
 /// The directories the walk must not enter: the target and build directories.
@@ -400,20 +526,6 @@ impl SkippedDirs {
     }
 }
 
-/// The directory components before a glob's first wildcard, after its package directory.
-fn literal_prefix(dir_components: &[&str], pattern: &str) -> Vec<String> {
-    dir_components
-        .iter()
-        .copied()
-        .chain(
-            pattern
-                .split('/')
-                .take_while(|part| !part.is_empty() && !part.contains(['*', '?', '[', '{', '\\'])),
-        )
-        .map(str::to_owned)
-        .collect()
-}
-
 /// A relative path with `/` separators on every platform, as globs and keys spell it.
 fn slash_path(path: &Path) -> String {
     path.iter()
@@ -452,21 +564,25 @@ mod tests {
             [
                 PackageGlobs {
                     id: "a",
+                    name: "a",
                     dir: Some(a_dir.to_owned()),
                     globs: &fixtures,
                 },
                 PackageGlobs {
                     id: "b",
+                    name: "b",
                     dir: Some("crates/b".to_owned()),
                     globs: &fixtures,
                 },
                 PackageGlobs {
                     id: "c",
+                    name: "c",
                     dir: None,
                     globs: &fixtures,
                 },
                 PackageGlobs {
                     id: "d",
+                    name: "d",
                     dir: Some("crates/d".to_owned()),
                     globs: &[],
                 },
@@ -624,5 +740,136 @@ mod tests {
         let patterns = patterns_with("crates/a", &["**/x".to_owned()]);
 
         assert!(patterns.could_contain(&directory));
+    }
+
+    /// One literal component of a drawn glob.
+    #[derive(Debug, Clone)]
+    enum Step {
+        Name(String),
+        Dot,
+        Parent,
+        Empty,
+    }
+
+    // Property: rooting a glob normalizes its literal part as a path would be: `.` and inner
+    // empty components are dropped, `..` removes the component before it (the package
+    // directory's included), and climbing above the workspace root, or a leading `/`, is
+    // refused. The rooted glob matches the file it names, and only from the declaring package's
+    // table.
+    #[hegel::test]
+    fn literal_parts_are_normalized_against_the_package_dir(tc: TestCase) {
+        let dir = tc.draw(gs::vecs(gs::text().alphabet("ab").min_size(1).max_size(2)).max_size(3));
+        let steps: Vec<Step> = tc.draw(
+            gs::vecs(hegel::one_of!(
+                gs::text()
+                    .alphabet("xy")
+                    .min_size(1)
+                    .max_size(2)
+                    .map(Step::Name),
+                gs::just(Step::Dot),
+                gs::just(Step::Parent),
+                gs::just(Step::Empty),
+            ))
+            .max_size(5),
+        );
+        let wildcard = tc.draw(gs::booleans());
+        let mut pattern_parts: Vec<&str> = steps
+            .iter()
+            .map(|step| match step {
+                Step::Name(name) => name.as_str(),
+                Step::Dot => ".",
+                Step::Parent => "..",
+                Step::Empty => "",
+            })
+            .collect();
+        pattern_parts.push(if wildcard { "*.txt" } else { "f.txt" });
+        let pattern = pattern_parts.join("/");
+        let dir_components: Vec<&str> = dir.iter().map(String::as_str).collect();
+        // A leading empty component makes the glob absolute (`/...`), which is refused.
+        let absolute = matches!(steps.first(), Some(Step::Empty));
+        let mut expected: Option<Vec<String>> = (!absolute).then(|| dir.clone());
+        for step in &steps {
+            // `as_mut()` turns `&mut Option<Vec>` into `Option<&mut Vec>`; `None` stays `None`
+            // once a `..` climbed out.
+            if let Some(stack) = expected.as_mut() {
+                match step {
+                    Step::Name(name) => stack.push(name.clone()),
+                    Step::Dot | Step::Empty => {}
+                    Step::Parent => {
+                        if stack.pop().is_none() {
+                            expected = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        let rooted = root_glob(&dir_components, &pattern);
+
+        let Some(mut expected) = expected else {
+            let refused = matches!(
+                &rooted,
+                Err(Error::InvalidGlob { reason, .. }) if reason == OUTSIDE_WORKSPACE
+            );
+            assert!(refused, "{pattern:?} from {dir:?}: {rooted:?}");
+            return;
+        };
+        let rooted = rooted.expect("the glob stays inside the workspace");
+        let file = expected
+            .iter()
+            .cloned()
+            .chain(["f.txt".to_owned()])
+            .collect::<Vec<_>>();
+        if !wildcard {
+            expected.push("f.txt".to_owned());
+        }
+        assert_eq!(rooted.prefix, expected, "{pattern:?} from {dir:?}");
+        let globs = [pattern.clone()];
+        let patterns = InputPatterns::from_parts(
+            &[],
+            [PackageGlobs {
+                id: "a",
+                name: "a",
+                dir: Some(dir.join("/")),
+                globs: &globs,
+            }],
+        )
+        .expect("valid globs");
+        assert_eq!(patterns.owners_of(&file.join("/")), [Owner::Package(0)]);
+    }
+
+    // Property: an absolute glob, and `..` after a wildcard, are refused in either table.
+    #[hegel::test]
+    fn globs_that_can_never_match_are_refused(tc: TestCase) {
+        let tail = tc.draw(gs::text().alphabet("xy").min_size(1).max_size(3));
+        let (pattern, reason) = tc.draw(gs::sampled_from(vec![
+            (format!("/{tail}/**"), OUTSIDE_WORKSPACE),
+            (format!("/{tail}"), OUTSIDE_WORKSPACE),
+            (format!("{tail}/*/../x"), PARENT_AFTER_WILDCARD),
+            (format!("**/../{tail}"), PARENT_AFTER_WILDCARD),
+        ]));
+        let in_package = tc.draw(gs::booleans());
+        let globs = [pattern.clone()];
+        let (workspace_globs, package_globs): (&[String], &[String]) = if in_package {
+            (&[], &globs)
+        } else {
+            (&globs, &[])
+        };
+
+        let compiled = InputPatterns::from_parts(
+            workspace_globs,
+            [PackageGlobs {
+                id: "a",
+                name: "a",
+                dir: Some("crates/a".to_owned()),
+                globs: package_globs,
+            }],
+        );
+
+        let refused = matches!(
+            &compiled,
+            Err(Error::InvalidGlob { pattern: at, reason: why }) if *at == pattern && why == reason
+        );
+        assert!(refused, "{compiled:?}");
     }
 }

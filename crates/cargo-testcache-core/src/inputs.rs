@@ -3,7 +3,10 @@
 //! The workspace is walked once. Each file is matched against one compiled set holding the
 //! workspace's globs (relative to its root) and every package's (relative to that package's
 //! directory, rewritten to be relative to the root), and the matching files are hashed in
-//! parallel. The target and build directories and `.git` are not walked.
+//! parallel. The target and build directories and `.git` are not walked, nor is any directory
+//! that no glob's literal prefix leads to. Symlinked files and directories are followed, as a
+//! test reading them would follow them; directories are compared to the target and build
+//! directories by canonical path, because Cargo does not normalize the paths it reports.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -47,6 +50,9 @@ pub struct InputPatterns {
     package_index: HashMap<String, usize>,
     /// Packages that declare inputs but lie outside the workspace root.
     outside: HashSet<String>,
+    /// For each glob, the directory components before its first wildcard. An empty prefix means
+    /// the glob can match anywhere.
+    prefixes: Vec<Vec<String>>,
 }
 
 impl InputPatterns {
@@ -98,9 +104,11 @@ impl InputPatterns {
         let mut owners = Vec::new();
         let mut package_index = HashMap::new();
         let mut outside = HashSet::new();
+        let mut prefixes = Vec::new();
         for pattern in workspace_globs {
             builder.add(glob(pattern)?);
             owners.push(Owner::Workspace);
+            prefixes.push(literal_prefix(&[], pattern));
         }
         for (index, package) in packages.into_iter().enumerate() {
             if package.globs.is_empty() {
@@ -111,15 +119,20 @@ impl InputPatterns {
                 outside.insert(package.id.to_owned());
                 continue;
             };
+            let dir_components: Vec<&str> =
+                dir.split('/').filter(|part| !part.is_empty()).collect();
+            // `escape` makes a directory such as `we[i]rd` match itself literally; it leaves
+            // `\` alone, which our globs treat as an escape, so that is wrapped in a class.
+            let escaped_dir = globset::escape(&dir).replace('\\', "[\\]");
             for pattern in package.globs {
-                // `escape` makes a directory such as `we[i]rd` match itself literally.
                 let rooted = if dir.is_empty() {
                     pattern.clone()
                 } else {
-                    format!("{}/{pattern}", globset::escape(&dir))
+                    format!("{escaped_dir}/{pattern}")
                 };
                 builder.add(glob(&rooted)?);
                 owners.push(Owner::Package(index));
+                prefixes.push(literal_prefix(&dir_components, pattern));
             }
         }
         let set = builder.build().map_err(|source| Error::InvalidGlob {
@@ -131,6 +144,29 @@ impl InputPatterns {
             owners,
             package_index,
             outside,
+            prefixes,
+        })
+    }
+
+    /// Whether a directory could hold a file some glob matches: it lies on the way to a glob's
+    /// literal prefix, or inside it. A glob without a literal prefix makes every directory
+    /// possible.
+    ///
+    /// # Arguments
+    ///
+    /// * `relative` - The directory, relative to the workspace root, with `/` separators; empty
+    ///   for the root.
+    ///
+    /// # Returns
+    ///
+    /// `false` only when no file below the directory can match.
+    fn could_contain(&self, relative: &str) -> bool {
+        self.prefixes.iter().any(|prefix| {
+            relative
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .zip(prefix)
+                .all(|(part, literal)| part == literal)
         })
     }
 
@@ -168,6 +204,11 @@ pub struct InputIndex {
 impl InputIndex {
     /// Walks the workspace and hashes every file an `inputs` glob matches.
     ///
+    /// The root, target and build directories are canonicalized first (the raw path when that
+    /// fails), because Cargo reports them as given. Symlinks to files and directories are
+    /// followed; dangling symlinks and symlinks into unsearchable directories are ignored with
+    /// a warning, since a test cannot read them either.
+    ///
     /// # Arguments
     ///
     /// * `workspace` - The workspace.
@@ -189,10 +230,14 @@ impl InputIndex {
         };
         let files = matched
             .into_par_iter()
-            .map(|(relative, owners, path)| InputFile {
-                digest: Digest::of_file(&path).map_err(|error| error.to_string()),
-                relative,
-                owners,
+            .map(|found| InputFile {
+                digest: if found.utf8 {
+                    Digest::of_file(&found.path).map_err(|error| error.to_string())
+                } else {
+                    Err("the path is not UTF-8".to_owned())
+                },
+                relative: found.relative,
+                owners: found.owners,
             })
             .collect();
         Ok(Self { patterns, files })
@@ -202,7 +247,7 @@ impl InputIndex {
     ///
     /// # Arguments
     ///
-    /// * `package_id` - The package.
+    /// * `package_id` - The package. An id that is not known gets only the workspace's inputs.
     ///
     /// # Returns
     ///
@@ -236,23 +281,56 @@ impl InputIndex {
     }
 }
 
+/// A file the walk matched.
+struct Found {
+    /// Workspace-relative, with `/` separators (lossy when the path is not UTF-8).
+    relative: String,
+    owners: Vec<Owner>,
+    path: PathBuf,
+    /// Whether the relative path is valid UTF-8, and so usable in a key.
+    utf8: bool,
+}
+
+/// A path as the OS reports it, or canonical when that fails to resolve.
+fn canonical_or_raw(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Walks the workspace for files the patterns match.
 ///
 /// # Returns
 ///
-/// Each match's workspace-relative name, owners and path.
-fn matching_files(
-    workspace: &Workspace,
-    patterns: &InputPatterns,
-) -> Vec<(String, Vec<Owner>, PathBuf)> {
-    let skipped = [workspace.target_dir(), workspace.build_dir()];
-    WalkDir::new(workspace.root())
+/// Each match.
+fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found> {
+    let root = canonical_or_raw(workspace.root());
+    let skipped = [
+        canonical_or_raw(workspace.target_dir()),
+        canonical_or_raw(workspace.build_dir()),
+    ];
+    WalkDir::new(&root)
+        .follow_links(true)
         .into_iter()
         // `filter_entry` stops the walk from descending into the directories it rejects.
         .filter_entry(|entry| {
-            !(entry.file_type().is_dir()
-                && (entry.file_name() == ".git" || skipped.contains(&entry.path())))
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            if !entry.file_type().is_dir() || entry.depth() == 0 {
+                return true;
+            }
+            // Descendants of the canonical root are canonical, except symlinks.
+            let is_skipped = if entry.path_is_symlink() {
+                skipped.contains(&canonical_or_raw(entry.path()))
+            } else {
+                skipped.iter().any(|dir| dir == entry.path())
+            };
+            let could_match = entry
+                .path()
+                .strip_prefix(&root)
+                .is_ok_and(|relative| patterns.could_contain(&slash_path(relative)));
+            !is_skipped && could_match
         })
+        // Dangling symlinks and loops are errors when links are followed.
         .filter_map(|entry| match entry {
             Ok(entry) => Some(entry),
             Err(error) => {
@@ -260,14 +338,36 @@ fn matching_files(
                 None
             }
         })
-        .filter(|entry| {
-            entry.file_type().is_file() || (entry.path_is_symlink() && entry.path().is_file())
-        })
+        .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| {
-            let relative = slash_path(entry.path().strip_prefix(workspace.root()).ok()?);
+            let relative_path = entry.path().strip_prefix(&root).ok()?;
+            let relative = slash_path(relative_path);
             let owners = patterns.owners_of(&relative);
-            (!owners.is_empty()).then(|| (relative, owners, entry.into_path()))
+            if owners.is_empty() {
+                return None;
+            }
+            let utf8 = relative_path.to_str().is_some();
+            Some(Found {
+                utf8,
+                relative,
+                owners,
+                path: entry.into_path(),
+            })
         })
+        .collect()
+}
+
+/// The directory components before a glob's first wildcard, after its package directory.
+fn literal_prefix(dir_components: &[&str], pattern: &str) -> Vec<String> {
+    dir_components
+        .iter()
+        .copied()
+        .chain(
+            pattern
+                .split('/')
+                .take_while(|part| !part.is_empty() && !part.contains(['*', '?', '[', '{', '\\'])),
+        )
+        .map(str::to_owned)
         .collect()
 }
 
@@ -291,9 +391,21 @@ mod tests {
     /// The workspace has `data/**`; packages a and b each have `fixtures/**` under their own
     /// directory (which may need escaping); package c is outside the workspace root.
     fn patterns(a_dir: &str) -> InputPatterns {
+        patterns_with(
+            a_dir,
+            &[
+                "data/**".to_owned(),
+                "*.txt".to_owned(),
+                "**/shared.txt".to_owned(),
+            ],
+        )
+    }
+
+    /// Like [`patterns`], with the given workspace globs.
+    fn patterns_with(a_dir: &str, workspace_globs: &[String]) -> InputPatterns {
         let fixtures = ["fixtures/**".to_owned()];
         InputPatterns::from_parts(
-            &["data/**".to_owned(), "*.txt".to_owned()],
+            workspace_globs,
             [
                 PackageGlobs {
                     id: "a",
@@ -329,7 +441,8 @@ mod tests {
     // does not cross `/`.
     #[hegel::test]
     fn files_are_owned_by_the_globs_that_match_them(tc: TestCase) {
-        let a_dir = tc.draw(gs::sampled_from(&["crates/a", "we[i]rd/*a", ""]).print_as_debug());
+        let a_dir =
+            tc.draw(gs::sampled_from(&["crates/a", "we[i]rd/*a", "we\\ird", ""]).print_as_debug());
         let name = draw_name(&tc);
         let patterns = patterns(a_dir);
         let in_a = if a_dir.is_empty() {
@@ -342,6 +455,10 @@ mod tests {
         assert_eq!(
             patterns.owners_of(&format!("crates/b/fixtures/{name}")),
             [Owner::Package(1)]
+        );
+        assert_eq!(
+            patterns.owners_of("crates/b/fixtures/shared.txt"),
+            [Owner::Workspace, Owner::Package(1)]
         );
         assert_eq!(
             patterns.owners_of(&format!("data/{name}")),
@@ -411,5 +528,58 @@ mod tests {
         );
         assert!(index.for_package("c").is_err());
         assert_eq!(index.for_package("d").map(|inputs| inputs.len()), Ok(1));
+    }
+
+    // Property: every directory on the way to a matched file could contain matches, and a
+    // directory outside every literal prefix could not.
+    #[hegel::test]
+    fn walk_pruning_keeps_the_way_to_every_match(tc: TestCase) {
+        let a_dir =
+            tc.draw(gs::sampled_from(&["crates/a", "we[i]rd/*a", "we\\ird", ""]).print_as_debug());
+        let name = draw_name(&tc);
+        let patterns = patterns_with(a_dir, &["data/**".to_owned()]);
+        let in_a = if a_dir.is_empty() {
+            format!("fixtures/{name}")
+        } else {
+            format!("{a_dir}/fixtures/{name}")
+        };
+
+        for file in [
+            in_a,
+            format!("crates/b/fixtures/{name}"),
+            format!("data/{name}"),
+        ] {
+            assert!(!patterns.owners_of(&file).is_empty(), "{file} is matched");
+            let mut directory = String::new();
+            assert!(patterns.could_contain(&directory));
+            for part in file.split('/').take(file.split('/').count() - 1) {
+                if !directory.is_empty() {
+                    directory.push('/');
+                }
+                directory.push_str(part);
+                assert!(
+                    patterns.could_contain(&directory),
+                    "{directory} leads to {file}"
+                );
+            }
+        }
+        for outside in [
+            "elsewhere",
+            "crates/c",
+            "crates/d",
+            "data2",
+            &format!("{name}/data"),
+        ] {
+            assert!(!patterns.could_contain(outside), "{outside} leads nowhere");
+        }
+    }
+
+    // Property: a glob that starts with a wildcard keeps every directory.
+    #[hegel::test]
+    fn a_leading_wildcard_prunes_nothing(tc: TestCase) {
+        let directory = format!("{}/{}", draw_name(&tc), draw_name(&tc));
+        let patterns = patterns_with("crates/a", &["**/x".to_owned()]);
+
+        assert!(patterns.could_contain(&directory));
     }
 }

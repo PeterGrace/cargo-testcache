@@ -4,6 +4,7 @@
 //! outcome to an exit status; everything else lives here, so tests and other crates can call it
 //! without spawning a process. `app::run` (added by a later task) is the entry point.
 
+pub mod args;
 pub mod config;
 pub mod error;
 pub mod key;

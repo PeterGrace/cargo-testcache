@@ -27,6 +27,10 @@ const FAILURE_CODE: i32 = 101;
 const DIFFERENT_BINARY: &str = "Cargo builds a different binary for this target alone (feature \
     unification); the direct runner (without --via-cargo) runs the hashed one";
 
+/// Why a pass is not recorded when a binary changed while it ran.
+const CHANGED_DURING_RUN: &str =
+    "the binary changed during the run (another build relinked it); the pass is not recorded";
+
 /// A file's digest, or why it could not be read. Spelled out because the crate's `Result`
 /// alias fixes the error type to [`Error`], and these errors are messages for a run reason.
 type FileDigest = std::result::Result<Digest, String>;
@@ -156,6 +160,9 @@ struct Planned<'a> {
     binary: &'a TestBinary,
     label: String,
     parts: std::result::Result<KeyParts, String>,
+    /// The binaries it may spawn, by their name in the key: hashed again before a pass is
+    /// recorded. Empty when they could not be known, and then `parts` is an error.
+    spawned: Vec<(String, PathBuf)>,
     decision: Decision,
 }
 
@@ -219,7 +226,7 @@ impl Session<'_> {
             .into_iter()
             .zip(spawned)
             .map(|((binary, package), spawned)| {
-                let parts = key_parts(binary, package, spawned, &context);
+                let parts = key_parts(binary, package, spawned.as_deref(), &context);
                 let policy = Policy {
                     no_cache: self.options.no_cache,
                     always_run: always_run.matches(package.name(), &binary.id.name),
@@ -229,6 +236,7 @@ impl Session<'_> {
                     label: report::label(binary, package.name(), package.root()),
                     binary,
                     parts,
+                    spawned: spawned.unwrap_or_default(),
                 }
             })
             .collect())
@@ -290,7 +298,9 @@ impl Session<'_> {
                     ));
                     tally.skipped();
                 }
-                Decision::Run(reason) => {
+                // `ref` borrows the reason instead of moving it out of `planned`, which
+                // `record_pass` takes whole once the reason is no longer used.
+                Decision::Run(ref reason) => {
                     // `bool::then` gives `Some(closure())` when true, else `None`.
                     let detail = options.explain.then(|| reason.to_string());
                     progress.line(&report::status_line(
@@ -325,25 +335,19 @@ impl Session<'_> {
                     let outcome = progress.suspended(|| exec::run(&mut command))?;
                     let passed = outcome.passed();
                     tally.ran(reason.category(), passed);
-                    if passed && !same_binary {
-                        progress.line(&report::status_line(
-                            "Not recorded",
-                            &planned.label,
-                            Some(DIFFERENT_BINARY),
-                        ));
-                    }
-                    // Only a pass of the hashed executable with a computable key is recorded.
-                    if same_binary
-                        && let Ok(parts) = planned.parts
-                        && let Some(record) = plan::pass_record(
-                            &planned.binary.id,
-                            parts,
-                            passed,
-                            outcome.duration,
-                            unix_now(),
-                        )
-                    {
-                        store.record(record)?;
+                    // Only a pass of the hashed executable is recorded.
+                    if !same_binary {
+                        if passed {
+                            progress.line(&report::status_line(
+                                "Not recorded",
+                                &planned.label,
+                                Some(DIFFERENT_BINARY),
+                            ));
+                        }
+                    } else {
+                        record_pass(store, planned, passed, outcome.duration, |line| {
+                            progress.line(line);
+                        })?;
                     }
                     if !passed && fail_fast {
                         tally.not_run(total - index - 1);
@@ -397,14 +401,10 @@ impl Session<'_> {
                 }),
             passed,
         );
-        let now = unix_now();
         for planned in planned {
-            if let Ok(parts) = planned.parts
-                && let Some(record) =
-                    plan::pass_record(&planned.binary.id, parts, passed, outcome.duration, now)
-            {
-                store.record(record)?;
-            }
+            record_pass(store, planned, passed, outcome.duration, |line| {
+                eprintln!("{line}");
+            })?;
         }
         eprintln!("{tally}");
         Ok(if passed {
@@ -440,6 +440,81 @@ impl Session<'_> {
         tally.doc_tests(exec::run(&mut command)?.passed());
         Ok(())
     }
+}
+
+/// Records a binary's pass under its key. Nothing is recorded for a failure, a key that could
+/// not be computed, or a binary whose executable or spawned binaries no longer have the digests
+/// in its key: another build relinked them between hashing and the end of the run, so the pass
+/// may be the other build's. That last case is reported through `say`.
+///
+/// # Arguments
+///
+/// * `store` - Where passes are recorded.
+/// * `planned` - The binary that ran.
+/// * `passed` - Whether it exited 0.
+/// * `duration` - How long it ran.
+/// * `say` - Prints a status line.
+///
+/// # Errors
+///
+/// When the store cannot be written.
+fn record_pass(
+    store: &mut Store,
+    planned: Planned<'_>,
+    passed: bool,
+    duration: Duration,
+    say: impl Fn(&str),
+) -> Result<()> {
+    let Ok(parts) = planned.parts else {
+        return Ok(());
+    };
+    if !passed {
+        return Ok(());
+    }
+    let binary = Digest::of_file(&planned.binary.executable).ok();
+    // Collecting `Option`s into one `Option` gives `None` if any file cannot be read.
+    let spawned: Option<BTreeMap<String, Digest>> = planned
+        .spawned
+        .iter()
+        .map(|(name, path)| {
+            Digest::of_file(path)
+                .ok()
+                .map(|digest| (name.clone(), digest))
+        })
+        .collect();
+    if !unchanged_since_hashing(&parts, binary, spawned.as_ref()) {
+        say(&report::status_line(
+            "Not recorded",
+            &planned.label,
+            Some(CHANGED_DURING_RUN),
+        ));
+        return Ok(());
+    }
+    if let Some(record) = plan::pass_record(&planned.binary.id, parts, passed, duration, unix_now())
+    {
+        store.record(record)?;
+    }
+    Ok(())
+}
+
+/// Whether the executable and spawned binaries, hashed again after a run, still have the
+/// digests in the key.
+///
+/// # Arguments
+///
+/// * `parts` - The key parts computed before the run.
+/// * `binary` - The executable's digest now, or `None` if it cannot be read.
+/// * `spawned` - The spawned binaries' digests now, or `None` if one cannot be read.
+///
+/// # Returns
+///
+/// `true` only when every digest is readable and unchanged.
+fn unchanged_since_hashing(
+    parts: &KeyParts,
+    binary: Option<Digest>,
+    spawned: Option<&BTreeMap<String, Digest>>,
+) -> bool {
+    binary == Some(parts.binary) && spawned == Some(&parts.spawned)
 }
 
 /// Prints what `status` found.
@@ -560,7 +635,7 @@ fn hash_files<'a>(paths: impl IntoIterator<Item = &'a Path>) -> HashMap<PathBuf,
 fn key_parts(
     binary: &TestBinary,
     package: &Package,
-    spawned: std::result::Result<Vec<(String, PathBuf)>, String>,
+    spawned: std::result::Result<&[(String, PathBuf)], &String>,
     context: &KeyContext<'_>,
 ) -> std::result::Result<KeyParts, String> {
     let digest = |path: &Path| {
@@ -574,9 +649,10 @@ fn key_parts(
         tool: context.tool.clone(),
         binary: digest(&binary.executable)?,
         // Collecting an iterator of `Result`s into one `Result` stops at the first error.
-        spawned: spawned?
-            .into_iter()
-            .map(|(name, path)| Ok((name, digest(&path)?)))
+        spawned: spawned
+            .map_err(String::clone)?
+            .iter()
+            .map(|(name, path)| Ok((name.clone(), digest(path)?)))
             .collect::<std::result::Result<_, String>>()?,
         inputs: context.inputs.for_package(&binary.id.package_id)?,
         env: key::env_part(context.workspace.env_names(package), context.environment),
@@ -600,7 +676,76 @@ mod tests {
     use hegel::generators::{self as gs, Generator};
 
     use crate::discover::TargetId;
+    use crate::key::testing::{draw_digest, draw_parts};
     use crate::workspace::testing::{ID, metadata};
+
+    /// How the files are found when they are hashed again after a run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Rehashed {
+        Unchanged,
+        BinaryChanged,
+        BinaryUnreadable,
+        SpawnedChanged,
+        SpawnedAdded,
+        SpawnedRemoved,
+        SpawnedUnreadable,
+    }
+
+    // Property: a pass is recorded only when the executable and every spawned binary, hashed
+    // again after the run, are readable and have the digests in the key.
+    #[hegel::test]
+    fn only_unchanged_binaries_are_recorded(tc: TestCase) {
+        let parts = draw_parts(&tc);
+        let rehashed = tc.draw(
+            gs::sampled_from(&[
+                Rehashed::Unchanged,
+                Rehashed::BinaryChanged,
+                Rehashed::BinaryUnreadable,
+                Rehashed::SpawnedChanged,
+                Rehashed::SpawnedAdded,
+                Rehashed::SpawnedRemoved,
+                Rehashed::SpawnedUnreadable,
+            ])
+            .print_as_debug(),
+        );
+        let other = draw_digest(&tc);
+        let mut binary = Some(parts.binary);
+        let mut spawned = Some(parts.spawned.clone());
+        let changes_something = match rehashed {
+            Rehashed::Unchanged => false,
+            Rehashed::BinaryChanged => {
+                binary = Some(Digest::of_bytes(&parts.binary.to_string().into_bytes()));
+                true
+            }
+            Rehashed::BinaryUnreadable => {
+                binary = None;
+                true
+            }
+            Rehashed::SpawnedChanged => {
+                match spawned.as_mut().and_then(|map| map.values_mut().next()) {
+                    Some(digest) => {
+                        *digest = Digest::of_bytes(&digest.to_string().into_bytes());
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Rehashed::SpawnedAdded => spawned
+                .as_mut()
+                .is_some_and(|map| map.insert("added".to_owned(), other) != Some(other)),
+            Rehashed::SpawnedRemoved => spawned
+                .as_mut()
+                .is_some_and(|map| map.pop_first().is_some()),
+            Rehashed::SpawnedUnreadable => {
+                spawned = None;
+                true
+            }
+        };
+
+        let unchanged = unchanged_since_hashing(&parts, binary, spawned.as_ref());
+
+        assert_eq!(unchanged, !changes_something, "{rehashed:?}");
+    }
 
     // Property: binaries run in Cargo's order, by kind then name within a package, and a binary
     // of a package missing from the metadata is an error.

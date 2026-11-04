@@ -89,6 +89,13 @@ pub fn run(options: &Options) -> Result<Outcome> {
         });
     }
     if let Some(flag) = options.cargo_args.passthrough_flag() {
+        // `status` runs nothing, so it cannot hand over to `cargo test` either.
+        if options.status_only {
+            return Err(Error::UnsupportedArgument {
+                argument: flag.to_owned(),
+                reason: "status cannot run cargo test unchanged",
+            });
+        }
         tracing::info!("{flag} given: running cargo test without the cache");
         let mut command =
             exec::cargo_test_command(&cargo, &options.cargo_args, &[], &options.test_args);
@@ -223,25 +230,25 @@ impl Session<'_> {
             .iter()
             .filter(|planned| matches!(planned.decision, Decision::Run(_)))
             .count();
-        // The toolchain is needed by the direct runner and to see whether a target runner is
-        // configured; with nothing to run, neither matters.
-        let toolchain = if to_run == 0 {
-            None
-        } else {
+        // The toolchain is needed only by the direct runner, and to see whether a configured
+        // target runner rules the direct runner out; `--via-cargo` never needs rustc.
+        let toolchain = if to_run > 0 && !options.via_cargo {
             Some(Toolchain::detect(self.cargo)?)
+        } else {
+            None
         };
         let runner_configured = toolchain
             .as_ref()
             .is_some_and(|toolchain| exec::configured_runner(toolchain, &options.cargo_args));
-        if runner_configured && !options.via_cargo {
+        if runner_configured {
             tracing::info!("a configured target runner forces the via-cargo runner");
         }
         let via_cargo = options.via_cargo || runner_configured;
         if via_cargo && to_run == planned.len() && to_run > 0 && !options.no_doc {
             return self.run_whole(store, planned);
         }
-        // `filter` turns `Some` into `None` when the runner goes through cargo: then no
-        // direct-run context exists, and each binary gets a via-cargo command below.
+        // `filter` turns `Some` into `None` when a runner forces cargo: then no direct-run
+        // context exists, and each binary gets a via-cargo command below.
         let context = toolchain
             .as_ref()
             .filter(|_| !via_cargo)
@@ -252,9 +259,11 @@ impl Session<'_> {
                 inherited_library_path: env::var_os(LIBRARY_PATH_VAR),
             });
         let fail_fast = !options.cargo_args.has("--no-fail-fast");
-        let mut tally = Tally::new(planned.len());
-        let progress = Progress::new(planned.len(), "test binaries");
-        for planned in planned {
+        let total = planned.len();
+        let mut tally = Tally::new(total);
+        let progress = Progress::new(total, "test binaries");
+        // `enumerate` pairs each item with its index, like Python's `enumerate`.
+        for (index, planned) in planned.into_iter().enumerate() {
             match planned.decision {
                 Decision::Skip { passed_at } => {
                     let detail = passed_ago(unix_now(), passed_at);
@@ -301,6 +310,7 @@ impl Session<'_> {
                         store.record(record)?;
                     }
                     if !passed && fail_fast {
+                        tally.not_run(total - index - 1);
                         break;
                     }
                 }
@@ -321,6 +331,17 @@ impl Session<'_> {
     /// included), recording every binary if it passes.
     fn run_whole(&self, store: &mut Store, planned: Vec<Planned<'_>>) -> Result<Outcome> {
         let options = self.options;
+        if options.explain {
+            for planned in &planned {
+                if let Decision::Run(reason) = &planned.decision {
+                    let detail = reason.to_string();
+                    eprintln!(
+                        "{}",
+                        report::status_line("Running", &planned.label, Some(&detail))
+                    );
+                }
+            }
+        }
         eprintln!("testcache: nothing is cached; running cargo test once");
         let mut command =
             exec::cargo_test_command(self.cargo, &options.cargo_args, &[], &options.test_args);
@@ -383,7 +404,7 @@ impl Session<'_> {
 
 /// Prints what `status` found.
 fn report_status(planned: &[Planned<'_>]) -> Outcome {
-    let mut tally = Tally::new(planned.len());
+    let mut tally = Tally::dry_run(planned.len());
     let now = unix_now();
     for planned in planned {
         match &planned.decision {

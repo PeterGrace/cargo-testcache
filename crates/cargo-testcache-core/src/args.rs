@@ -25,6 +25,36 @@ const TARGET_SELECTION: [&str; 6] = [
 const PASSTHROUGH: [&str; 2] = ["--no-run", "--doc"];
 /// Arguments this tool sets itself.
 const UNSUPPORTED: [&str; 1] = ["--message-format"];
+/// `cargo test` options (cargo 1.99's `cargo test --help`) whose value must follow, as
+/// `--jobs 4`, when it is not attached (`--jobs=4`, `-j4`). `--lockfile-path` is unstable
+/// (`-Z unstable-options`) and missing from the help, but takes a value all the same.
+const CARGO_REQUIRED_VALUE: [&str; 14] = [
+    "--message-format",
+    "--color",
+    "--config",
+    "-Z",
+    "--exclude",
+    "-F",
+    "--features",
+    "-j",
+    "--jobs",
+    "--profile",
+    "--target-dir",
+    "-m",
+    "--manifest-path",
+    "--lockfile-path",
+];
+/// `cargo test` options whose value is optional (`--test [<NAME>]` lists the test targets
+/// when it has none): the next argument is their value unless it starts with `-`.
+const CARGO_OPTIONAL_VALUE: [&str; 7] = [
+    "-p",
+    "--package",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "--target",
+];
 
 /// Whether one of the tool's own options takes a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,13 +88,20 @@ pub struct SplitArgs {
 ///
 /// # Returns
 ///
-/// The three groups, each in its original order.
+/// The three groups, each in its original order, except that `cargo test`'s positional
+/// `[TESTNAME]` filter moves from the Cargo group to the front of the test arguments:
+/// `cargo test FOO` means the same as `cargo test -- FOO`, and only test arguments are part of
+/// a binary's key and reach a binary run directly. Values of `cargo test`'s value-taking
+/// options are recognized and never moved.
 ///
 /// # Limits
 ///
 /// The values of Cargo's own options are not consumed, so a Cargo value spelled exactly like one
 /// of the tool's flags is taken as the tool's. Clustered short options (`-hV`) are not taken
-/// apart and go to Cargo. An argument that is not valid UTF-8 always goes to Cargo.
+/// apart and go to Cargo. An argument that is not valid UTF-8 and starts with `-` goes to Cargo.
+/// A value-taking Cargo option this tool does not know (a newer Cargo's) has its separate value
+/// taken for the test name; Cargo then fails loudly on the missing value rather than silently
+/// running the wrong tests.
 pub fn split(
     args: impl IntoIterator<Item = OsString>,
     subcommands: &[&str],
@@ -104,7 +141,50 @@ pub fn split(
             None => split.cargo.0.push(arg),
         }
     }
+    if let Some(name) = take_test_name(&mut split.cargo.0) {
+        split.test.insert(0, name);
+    }
     split
+}
+
+/// Removes and returns `cargo test`'s positional `[TESTNAME]`: the first argument that is
+/// neither an option nor the value of one.
+///
+/// Values are recognized from [`CARGO_REQUIRED_VALUE`] and [`CARGO_OPTIONAL_VALUE`]. Cargo
+/// accepts one `TESTNAME`, so a second positional argument stays among Cargo's arguments and
+/// Cargo rejects it. An option that takes a value but is missing from those lists (a newer
+/// Cargo's) would have its separate value taken for `TESTNAME`; Cargo then fails loudly on the
+/// option's missing value instead of silently running the wrong tests.
+///
+/// # Arguments
+///
+/// * `args` - Cargo's arguments, without `--` and what follows it.
+///
+/// # Returns
+///
+/// The filter, or `None` when there is none.
+fn take_test_name(args: &mut Vec<OsString>) -> Option<OsString> {
+    let mut index = 0;
+    // `while let Some(x) = ...` loops until the expression gives `None`, like a `while` over
+    // Python's `walrus` assignment.
+    while let Some(arg) = args.get(index) {
+        if is_positional(arg) {
+            return Some(args.remove(index));
+        }
+        let next = args.get(index + 1);
+        let takes_next = CARGO_REQUIRED_VALUE.iter().any(|flag| arg == *flag)
+            || (CARGO_OPTIONAL_VALUE.iter().any(|flag| arg == *flag)
+                && next.is_some_and(|next| is_positional(next)));
+        // `usize::from(bool)` is 1 for true and 0 for false, like Python's `int(True)`.
+        index += 1 + usize::from(takes_next && next.is_some());
+    }
+    None
+}
+
+/// Whether an argument is positional: it does not start with `-`, or it is `-` alone.
+fn is_positional(arg: &OsStr) -> bool {
+    let bytes = arg.as_encoded_bytes();
+    bytes.first() != Some(&b'-') || bytes.len() == 1
 }
 
 /// The option name of an argument: `--name` from `--name=value`, or `None` if it is not an
@@ -484,8 +564,9 @@ mod tests {
         assert_eq!(split.test, os(&test));
     }
 
-    // Property: an argument that is not UTF-8 goes to cargo unchanged, and flags with a
-    // non-UTF-8 attached value are still found, read and removed.
+    // Property: an option that is not UTF-8 goes to cargo unchanged, a positional one becomes
+    // the test name, and flags with a non-UTF-8 attached value are still found, read and
+    // removed.
     #[cfg(unix)]
     #[hegel::test]
     fn non_utf8_arguments_are_handled_bytewise(tc: TestCase) {
@@ -502,10 +583,13 @@ mod tests {
         target_dir.extend_from_slice(&bytes);
         let target_dir = OsString::from_vec(target_dir);
 
-        let split = split([arbitrary.clone()], &[], classify);
+        let option = OsString::from_vec([b"--x".as_slice(), &bytes].concat());
+
+        let split = split([option.clone(), arbitrary.clone()], &[], classify);
         let cargo = CargoArgs::new(vec![package.clone(), target_dir.clone(), arbitrary.clone()]);
 
-        assert_eq!(split.cargo.as_slice(), [arbitrary.clone()].as_slice());
+        assert_eq!(split.cargo.as_slice(), [option].as_slice());
+        assert_eq!(split.test.as_slice(), std::slice::from_ref(&arbitrary));
         assert!(cargo.has("--package"));
         assert_eq!(
             cargo.value("--target-dir"),
@@ -514,6 +598,102 @@ mod tests {
         assert_eq!(
             cargo.without_selection().as_slice(),
             [target_dir, arbitrary].as_slice()
+        );
+    }
+
+    /// Cargo arguments that never hold a positional `TESTNAME`: switches, and options with
+    /// their values, separate or attached, required or optional.
+    const CARGO_PIECES: [&[&str]; 16] = [
+        &["--release"],
+        &["--no-fail-fast"],
+        &["-p", "alpha"],
+        &["-palpha"],
+        &["--package=alpha"],
+        &["--test", "it"],
+        &["--test"],
+        &["--bin", "b"],
+        &["--target", "x86_64-unknown-linux-gnu"],
+        &["--features", "f"],
+        &["-j", "4"],
+        &["-j4"],
+        &["--color", "always"],
+        &["--manifest-path", "m/Cargo.toml"],
+        &["--config", "k=v"],
+        &["-Z", "flag"],
+    ];
+
+    // Property: the first positional argument among Cargo's moves to the front of the test
+    // arguments, the values of value-taking options never move, a second positional argument
+    // stays with Cargo's, and everything else keeps its group and order.
+    #[hegel::test]
+    fn a_positional_filter_becomes_the_first_test_argument(tc: TestCase) {
+        let pieces = tc
+            .draw(gs::vecs(gs::integers::<usize>().max_value(CARGO_PIECES.len() - 1)).max_size(6));
+        let filter = tc.draw(gs::optional(gs::tuples!(
+            gs::integers::<usize>().max_value(pieces.len()),
+            gs::text().alphabet("abc_").min_size(1).max_size(4)
+        )));
+        let second = tc.draw(gs::booleans());
+        let rest = tc.draw(
+            gs::vecs(gs::sampled_from(&["--exact", "other", "-p"]).print_as_debug()).max_size(3),
+        );
+
+        let mut cargo: Vec<&str> = Vec::new();
+        let mut argv: Vec<&str> = Vec::new();
+        for (position, piece) in pieces.iter().enumerate() {
+            if let Some((at, name)) = &filter
+                && *at == position
+            {
+                argv.push(name);
+            }
+            // A bare `--test` right before the filter would take it as its value, as cargo
+            // does too, so `--test` alone is swapped for `--lib` whenever a filter is drawn.
+            let piece = CARGO_PIECES[*piece];
+            let piece = if piece == ["--test"] && filter.is_some() {
+                ["--lib"].as_slice()
+            } else {
+                piece
+            };
+            argv.extend_from_slice(piece);
+            cargo.extend_from_slice(piece);
+        }
+        if let Some((at, name)) = &filter
+            && *at == pieces.len()
+        {
+            argv.push(name);
+        }
+        if second && filter.is_some() {
+            argv.push("extra");
+            cargo.push("extra");
+        }
+        argv.push("--");
+        argv.extend_from_slice(&rest);
+
+        let split = split(os(&argv), &[], classify);
+
+        let mut test: Vec<&str> = filter.iter().map(|(_, name)| name.as_str()).collect();
+        test.extend_from_slice(&rest);
+        assert_eq!(split.cargo.as_slice(), os(&cargo).as_slice());
+        assert_eq!(split.test, os(&test));
+    }
+
+    // Property: a positional filter is part of the test arguments' digest, so a filtered pass
+    // is never recorded under the unfiltered key.
+    #[hegel::test]
+    fn a_positional_filter_changes_the_args_digest(tc: TestCase) {
+        let name = tc.draw(gs::text().alphabet("abc_").min_size(1).max_size(6));
+        let rest = tc.draw(gs::vecs(gs::text().alphabet("-xyz").max_size(4)).max_size(3));
+        let mut unfiltered = vec!["-p", "alpha", "--"];
+        unfiltered.extend(rest.iter().map(String::as_str));
+        let mut filtered = vec!["-p", "alpha", name.as_str(), "--"];
+        filtered.extend(rest.iter().map(String::as_str));
+
+        let without = split(os(&unfiltered), &[], classify);
+        let with = split(os(&filtered), &[], classify);
+
+        assert_ne!(
+            crate::key::KeyParts::args_digest(&with.test),
+            crate::key::KeyParts::args_digest(&without.test)
         );
     }
 }

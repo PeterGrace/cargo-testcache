@@ -19,6 +19,10 @@ pub struct Tally {
     skipped: usize,
     failed: usize,
     run: BTreeMap<ReasonCategory, usize>,
+    /// Binaries left out after a failure under fail-fast.
+    not_run: usize,
+    /// The tally of `status`: binaries "would run" rather than "run".
+    dry_run: bool,
     /// A whole-workspace `cargo test` (the via-cargo shortcut) failed; which binary is unknown.
     whole_run_failed: bool,
     doc_tests_failed: bool,
@@ -41,6 +45,31 @@ impl Tally {
             binaries,
             ..Self::default()
         }
+    }
+
+    /// An empty tally for `status`, which runs nothing: the summary says "would run".
+    ///
+    /// # Arguments
+    ///
+    /// * `binaries` - How many test binaries the build produced.
+    ///
+    /// # Returns
+    ///
+    /// A tally with every count at zero.
+    pub fn dry_run(binaries: usize) -> Self {
+        Self {
+            dry_run: true,
+            ..Self::new(binaries)
+        }
+    }
+
+    /// Counts the binaries left out because an earlier one failed under fail-fast.
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - How many were left out.
+    pub fn not_run(&mut self, count: usize) {
+        self.not_run += count;
     }
 
     /// Counts a skipped binary.
@@ -102,7 +131,12 @@ impl fmt::Display for Tally {
             "binaries"
         };
         let run: usize = self.run.values().sum();
-        write!(formatter, "testcache: {} {noun}, {run} run", self.binaries)?;
+        let verb = if self.dry_run { "would run" } else { "run" };
+        write!(
+            formatter,
+            "testcache: {} {noun}, {run} {verb}",
+            self.binaries
+        )?;
         if run > 0 {
             let reasons: Vec<String> = self
                 .run
@@ -112,6 +146,9 @@ impl fmt::Display for Tally {
             write!(formatter, " ({})", reasons.join(", "))?;
         }
         write!(formatter, ", {} skipped", self.skipped)?;
+        if self.not_run > 0 {
+            write!(formatter, ", {} not run", self.not_run)?;
+        }
         if self.failed > 0 {
             write!(formatter, "; {} failed", self.failed)?;
         }
@@ -284,8 +321,9 @@ mod tests {
         ReasonCategory::Unavailable,
     ];
 
-    // Property: the summary line states the counts, lists reasons only when something ran, and
-    // mentions failures only when there were some.
+    // Property: the summary line states the counts ("would run" for status), lists reasons
+    // only when something ran, mentions binaries left out by fail-fast only when there were
+    // some, and failures only when there were some.
     #[hegel::test]
     fn the_summary_line_states_the_counts(tc: TestCase) {
         let events = tc.draw(
@@ -295,13 +333,21 @@ mod tests {
             )))
             .max_size(8),
         );
-        let mut tally = Tally::new(events.len());
+        let not_run = tc.draw(gs::integers::<usize>().max_value(3));
+        let status = tc.draw(gs::booleans());
+        let binaries = events.len() + not_run;
+        let mut tally = if status {
+            Tally::dry_run(binaries)
+        } else {
+            Tally::new(binaries)
+        };
         for event in &events {
             match event {
                 None => tally.skipped(),
                 Some((category, passed)) => tally.ran(*category, *passed),
             }
         }
+        tally.not_run(not_run);
 
         let line = tally.to_string();
 
@@ -311,17 +357,19 @@ mod tests {
             .flatten()
             .filter(|(_, passed)| !passed)
             .count();
-        let noun = if events.len() == 1 {
-            "binary"
-        } else {
-            "binaries"
-        };
+        let noun = if binaries == 1 { "binary" } else { "binaries" };
+        let verb = if status { "would run" } else { "run" };
         assert!(
-            line.starts_with(&format!("testcache: {} {noun}, {run} run", events.len())),
+            line.starts_with(&format!("testcache: {binaries} {noun}, {run} {verb}")),
             "{line}"
         );
         assert!(
             line.contains(&format!("{} skipped", events.len() - run)),
+            "{line}"
+        );
+        assert_eq!(
+            line.contains(&format!(", {not_run} not run")),
+            not_run > 0,
             "{line}"
         );
         assert_eq!(line.contains('('), run > 0, "{line}");

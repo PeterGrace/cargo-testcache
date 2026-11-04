@@ -30,6 +30,8 @@ struct RawMetadata {
     target_directory: PathBuf,
     /// Present since Cargo 1.91; the target directory before that.
     build_directory: Option<PathBuf>,
+    /// The ids of the workspace's own packages, as opposed to its dependencies.
+    workspace_members: Vec<String>,
     /// `[workspace.metadata]`.
     metadata: Option<Value>,
     packages: Vec<RawPackage>,
@@ -66,12 +68,13 @@ pub struct Package {
 
 impl Package {
     /// Builds a package from its metadata.
-    fn new(raw: RawPackage, config: TestcacheConfig) -> Self {
+    fn new(raw: RawPackage, config: TestcacheConfig, workspace_root: &Path) -> Self {
+        // Cargo always reports an absolute manifest path, so the parent exists; the fallback
+        // only keeps this total.
         let root = raw
             .manifest_path
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+            .map_or_else(|| workspace_root.to_path_buf(), Path::to_path_buf);
         Self {
             env: package_env(&raw, &root),
             name: raw.name,
@@ -101,7 +104,8 @@ impl Package {
     }
 }
 
-/// The workspace.
+/// The workspace: its directories, its configuration table and every package `cargo metadata`
+/// lists, members and dependencies alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     root: PathBuf,
@@ -167,6 +171,11 @@ impl Workspace {
     /// # Errors
     ///
     /// [`Error::Json`] for malformed output, [`Error::InvalidManifest`] for a bad table.
+    ///
+    /// Only workspace members' `[package.metadata.testcache]` tables are read. Every other
+    /// package (a dependency, kept so `cargo test -p <dependency>` finds it) gets the default
+    /// configuration, so a third-party crate's unrelated table can neither fail the run nor
+    /// add `always_run` patterns.
     pub fn from_json(json: &[u8]) -> Result<Self> {
         let raw: RawMetadata = serde_json::from_slice(json).map_err(|source| Error::Json {
             what: "cargo metadata output".to_owned(),
@@ -177,9 +186,16 @@ impl Workspace {
             .packages
             .into_iter()
             .map(|package| {
-                let location = format!("package `{}`", package.name);
-                let config = TestcacheConfig::from_metadata(package.metadata.as_ref(), &location)?;
-                Ok((package.id.clone(), Package::new(package, config)))
+                let config = if raw.workspace_members.contains(&package.id) {
+                    let location = format!("package `{}`", package.name);
+                    TestcacheConfig::from_metadata(package.metadata.as_ref(), &location)?
+                } else {
+                    TestcacheConfig::default()
+                };
+                Ok((
+                    package.id.clone(),
+                    Package::new(package, config, &raw.workspace_root),
+                ))
             })
             .collect::<Result<HashMap<_, _>>>()?;
         Ok(Self {
@@ -219,11 +235,23 @@ impl Workspace {
     }
 
     /// A package by its id.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The package id from `cargo metadata`.
+    ///
+    /// # Returns
+    ///
+    /// The package, or `None` if the id is unknown.
     pub fn package(&self, id: &str) -> Option<&Package> {
         self.packages.get(id)
     }
 
     /// Every package, with its id.
+    ///
+    /// # Returns
+    ///
+    /// An iterator over `(id, package)` pairs, in no particular order.
     pub fn packages(&self) -> impl Iterator<Item = (&str, &Package)> {
         self.packages
             .iter()
@@ -231,6 +259,14 @@ impl Workspace {
     }
 
     /// The environment variable names whose values are part of a package's keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `package` - A package of this workspace.
+    ///
+    /// # Returns
+    ///
+    /// The workspace's names, then the package's.
     pub fn env_names<'a>(&'a self, package: &'a Package) -> impl Iterator<Item = &'a str> {
         self.config
             .env
@@ -240,6 +276,14 @@ impl Workspace {
     }
 
     /// The `spawns` paths that apply to a package.
+    ///
+    /// # Arguments
+    ///
+    /// * `package` - A package of this workspace.
+    ///
+    /// # Returns
+    ///
+    /// The workspace's paths, then the package's.
     pub fn spawns<'a>(&'a self, package: &'a Package) -> impl Iterator<Item = &'a str> {
         self.config
             .spawns
@@ -338,6 +382,7 @@ pub(crate) mod testing {
             "workspace_root": "/ws",
             "target_directory": "/ws/target",
             "build_directory": build_directory,
+            "workspace_members": [ID],
             "metadata": { "testcache": { "inputs": ["data/**"], "env": ["W"] } },
             "packages": [{
                 "id": ID, "name": "a", "version": version,
@@ -352,11 +397,33 @@ pub(crate) mod testing {
         .to_string()
         .into_bytes()
     }
+
+    /// The id of [`metadata_with_dependency`]'s second package.
+    pub(crate) const DEPENDENCY_ID: &str = "registry+https://example.com/index#dep@1.0.0";
+
+    /// [`metadata`] plus a package `dep` whose `[package.metadata]` has an unknown testcache
+    /// key, listed as a workspace member only when `member` is true.
+    pub(crate) fn metadata_with_dependency(member: bool) -> Vec<u8> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&metadata("0.1.0", None)).expect("the fixture is JSON");
+        value["packages"]
+            .as_array_mut()
+            .expect("packages is an array")
+            .push(json!({
+                "id": DEPENDENCY_ID, "name": "dep", "version": "1.0.0",
+                "manifest_path": "/registry/dep/Cargo.toml",
+                "metadata": { "testcache": { "bogus": 1 } },
+            }));
+        if member {
+            value["workspace_members"] = json!([ID, DEPENDENCY_ID]);
+        }
+        value.to_string().into_bytes()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{ID, metadata};
+    use super::testing::{DEPENDENCY_ID, ID, metadata, metadata_with_dependency};
     use super::*;
 
     use std::ffi::OsStr;
@@ -390,8 +457,8 @@ mod tests {
     fn version_parts_are_split_as_cargo_does(tc: TestCase) {
         let [major, minor, patch] = [0, 1, 2].map(|_| tc.draw(gs::integers::<u32>()));
         // `1` is the only digit, so no numeric identifier has a leading zero, which semver forbids.
-        let pre = identifiers(&tc, "abc1");
-        let build = identifiers(&tc, "xyz9");
+        let pre = identifiers(&tc, "abc1-");
+        let build = identifiers(&tc, "xyz9-");
         let mut version = format!("{major}.{minor}.{patch}");
         if let Some(pre) = &pre {
             version = format!("{version}-{pre}");
@@ -455,7 +522,12 @@ mod tests {
 
         let artifact_dir = workspace.artifact_dir(&executable);
 
-        assert_eq!(artifact_dir, Some(Path::new("/ws/target").join(relative)));
+        assert_eq!(artifact_dir, Some(Path::new("/ws/target").join(&relative)));
+        let outside = Path::new("/elsewhere")
+            .join(&relative)
+            .join("deps")
+            .join("t-0123");
+        assert_eq!(workspace.artifact_dir(&outside), None);
     }
 
     // Property: the workspace's and the package's `env` names both apply to the package.
@@ -469,5 +541,23 @@ mod tests {
 
         assert_eq!(names, ["W", "P"]);
         assert_eq!(workspace.config().inputs, ["data/**"]);
+    }
+
+    // Property: a dependency's testcache table is not read (it loads with the default config),
+    // while the same table on a workspace member is rejected.
+    #[hegel::test]
+    fn only_members_tables_are_read(tc: TestCase) {
+        let member = tc.draw(gs::booleans());
+
+        let loaded = Workspace::from_json(&metadata_with_dependency(member));
+
+        if member {
+            assert!(matches!(loaded, Err(Error::InvalidManifest { .. })));
+        } else {
+            let workspace = loaded.expect("a dependency's table is ignored");
+            let dependency = workspace.package(DEPENDENCY_ID).expect("listed");
+            assert_eq!(dependency.config(), &TestcacheConfig::default());
+            assert_eq!(dependency.name(), "dep");
+        }
     }
 }

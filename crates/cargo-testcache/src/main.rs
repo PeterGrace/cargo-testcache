@@ -91,8 +91,8 @@ fn main() -> ExitCode {
     for warning in dotenv_warnings {
         warn!("{warning}");
     }
-    if let Some(name) = misplaced {
-        warn!("`{name}` was taken as a test-name filter; put the subcommand first");
+    if let Some(message) = misplaced {
+        warn!("{message}");
     }
 
     let outcome = config
@@ -113,13 +113,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// The subcommand name that was taken as a positional test-name filter, if any.
+/// The warning for a subcommand name (or `help`) that was taken as a positional test-name
+/// filter, if that happened.
 fn misplaced_subcommand(split: &SplitArgs) -> Option<String> {
     let name = split.test.first()?.to_str()?;
+    if !split.starts_with_filter {
+        return None;
+    }
+    if name == "help" {
+        return Some("`help` was taken as a test-name filter; use --help".to_owned());
+    }
     let is_subcommand = Cli::command()
         .get_subcommands()
         .any(|command| command.get_name() == name);
-    (split.starts_with_filter && is_subcommand).then(|| name.to_owned())
+    is_subcommand
+        .then(|| format!("`{name}` was taken as a test-name filter; put the subcommand first"))
 }
 
 /// Splits the command line, recognizing exactly the options and subcommands clap defines.
@@ -279,5 +287,26 @@ mod tests {
         assert_eq!(cli.no_doc, has("--no-doc"));
         assert_eq!(cli.log_format.is_some(), json);
         assert_eq!(matches!(cli.mode, Some(Mode::Status)), status);
+    }
+
+    // Property: only a positional filter spelled like a subcommand or `help` is warned about;
+    // the same word after `--`, or any other filter, is not.
+    #[hegel::test]
+    fn misplaced_subcommand_warns_only_for_a_positional_name(tc: TestCase) {
+        let word = tc.draw(gs::sampled_from(vec!["status", "clear", "help", "my_test"]));
+        let after_separator = tc.draw(gs::booleans());
+        let argv: Vec<OsString> = if after_separator {
+            ["-p", "alpha", "--", word].map(OsString::from).to_vec()
+        } else {
+            ["-p", "alpha", word].map(OsString::from).to_vec()
+        };
+
+        let warning = misplaced_subcommand(&split_command_line(argv));
+
+        let expected = !after_separator && word != "my_test";
+        assert_eq!(warning.is_some(), expected);
+        if let Some(message) = warning {
+            assert!(message.starts_with(&format!("`{word}` was taken")));
+        }
     }
 }

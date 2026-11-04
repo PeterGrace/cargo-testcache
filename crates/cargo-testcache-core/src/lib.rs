@@ -11,6 +11,7 @@ pub mod error;
 pub mod inputs;
 pub mod key;
 pub mod manifest;
+pub mod store;
 pub mod workspace;
 
 // Re-exports, so callers can write `cargo_testcache_core::Config` rather than the full path.

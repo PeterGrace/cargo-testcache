@@ -176,7 +176,7 @@ impl Build {
 ///
 /// # Errors
 ///
-/// When Cargo cannot be started or its output cannot be read.
+/// When Cargo cannot be started, its output cannot be read, or waiting for it fails.
 pub fn build(cargo: &Path, args: &CargoArgs) -> Result<(ExitStatus, Build)> {
     let mut child = Command::new(cargo)
         .args([
@@ -204,22 +204,29 @@ pub fn build(cargo: &Path, args: &CargoArgs) -> Result<(ExitStatus, Build)> {
 ///
 /// # Returns
 ///
-/// What was built. Lines that are not messages are logged at debug level and skipped.
+/// What was built. Lines that are not JSON are logged at debug level and skipped; JSON messages
+/// that cannot be read are logged as warnings and skipped.
 ///
 /// # Errors
 ///
 /// When reading fails.
 pub fn parse(output: impl BufRead) -> Result<Build> {
     let mut build = Build::default();
-    for line in output.lines() {
+    // Split on bytes, not `lines()`, so a line that is not UTF-8 is skipped, not a read error.
+    for line in output.split(b'\n') {
         let line = line.map_err(Error::io("reading cargo's build output"))?;
-        match serde_json::from_str::<Message>(&line) {
+        match serde_json::from_slice::<Message>(&line) {
             Ok(Message::CompilerArtifact(artifact)) => build.add_artifact(artifact),
             Ok(Message::BuildScriptExecuted(script)) => build
                 .linked_paths
                 .extend(script.linked_paths.iter().map(|path| linked_path(path))),
             Ok(Message::Other) => {}
-            Err(error) => tracing::debug!(%error, line, "skipping a line that is not a message"),
+            Err(error) if serde_json::from_slice::<serde_json::Value>(&line).is_ok() => {
+                // Valid JSON that does not fit our types: Cargo's schema may have changed, and a
+                // dropped artifact would make a test binary silently vanish.
+                tracing::warn!(%error, "skipping a Cargo message that could not be read");
+            }
+            Err(error) => tracing::debug!(%error, "skipping a line that is not a message"),
         }
     }
     Ok(build)
@@ -320,14 +327,37 @@ mod tests {
             .map(|b| (b.id.package_id.clone(), b.id.name.clone()))
             .collect();
         assert_eq!(found, expected);
-        for f in fed
+        let expected_kinds: Vec<TargetKind> = fed
+            .iter()
+            .filter(|f| f.test && f.executable && f.kind != "custom-build")
+            .map(|f| match f.kind {
+                "lib" | "proc-macro" => TargetKind::Lib,
+                "bin" => TargetKind::Bin,
+                "test" => TargetKind::Test,
+                "bench" => TargetKind::Bench,
+                "example" => TargetKind::Example,
+                other => unreachable!("unexpected kind {other}"),
+            })
+            .collect();
+        let found_kinds: Vec<TargetKind> = build.binaries.iter().map(|b| b.id.kind).collect();
+        assert_eq!(found_kinds, expected_kinds);
+        let bins: Vec<&Fed> = fed
             .iter()
             .filter(|f| !f.test && f.executable && f.kind == "bin")
-        {
-            assert!(build.package_bins[f.package].contains_key(&f.name), "{f:?}");
+            .collect();
+        for f in &bins {
+            let last = bins
+                .iter()
+                .rev()
+                .find(|g| g.package == f.package && g.name == f.name)
+                .expect("f itself matches");
+            let want = PathBuf::from(format!("/exe/{}-{}", last.package, last.name));
+            assert_eq!(build.package_bins[f.package][&f.name], want, "{f:?}");
         }
+        let distinct: std::collections::BTreeSet<(&str, &str)> =
+            bins.iter().map(|f| (f.package, f.name.as_str())).collect();
         let bin_count: usize = build.package_bins.values().map(BTreeMap::len).sum();
-        assert!(bin_count <= fed.iter().filter(|f| !f.test && f.kind == "bin").count());
+        assert_eq!(bin_count, distinct.len());
         assert_eq!(
             build.linked_paths,
             [PathBuf::from("/t/native"), PathBuf::from("/t/plain")]

@@ -100,7 +100,7 @@ impl Digest {
     pub fn of_file(path: &Path) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let mut hasher = Sha256::new();
-        // On the heap: rayon's worker threads have small stacks.
+        // On the heap, to keep 256 KiB off the stack.
         let mut chunk = vec![0_u8; READ_CHUNK];
         loop {
             match file.read(&mut chunk) {
@@ -114,6 +114,10 @@ impl Digest {
     }
 
     /// The digest's raw bytes.
+    ///
+    /// # Returns
+    ///
+    /// The 32 bytes of the SHA-256 digest.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -149,6 +153,10 @@ pub struct KeyParts {
 
 impl KeyParts {
     /// The value of [`KeyParts::tool`] for this build of the tool.
+    ///
+    /// # Returns
+    ///
+    /// The crate version and [`KEY_FORMAT_VERSION`], such as `0.1.0+key1`.
     pub fn tool_id() -> String {
         // `env!` reads a variable at compile time; Cargo sets `CARGO_PKG_VERSION` while building.
         format!("{}+key{KEY_FORMAT_VERSION}", env!("CARGO_PKG_VERSION"))
@@ -210,6 +218,8 @@ pub fn env_part<'a>(
             .map(|value| Digest::of_os_str(value));
         (name.to_owned(), value)
     });
+    // A RUST_TEST_TIME_* variable whose name is not UTF-8 is ignored: libtest reads these by
+    // UTF-8 name only.
     let prefixed = environment.iter().filter_map(|(name, value)| {
         let name = name.to_str()?;
         name.starts_with(ALWAYS_KEYED_ENV_PREFIX)
@@ -321,6 +331,7 @@ mod tests {
     use super::testing::{draw_digest, draw_parts, mutate_one_part};
     use super::*;
 
+    use std::collections::BTreeSet;
     use std::io::Write;
 
     use hegel::TestCase;
@@ -429,11 +440,44 @@ mod tests {
             let is_set = set.contains(name);
             assert_eq!(part.get(*name).map(Option::is_some), Some(is_set), "{name}");
         }
-        if set.contains(&"RUST_TEST_TIME_UNIT") {
-            assert!(part.contains_key("RUST_TEST_TIME_UNIT"));
+        let expected_names: BTreeSet<&str> = declared
+            .iter()
+            .copied()
+            .chain(ALWAYS_KEYED_ENV)
+            .chain(
+                set.iter()
+                    .copied()
+                    .filter(|name| name.starts_with(ALWAYS_KEYED_ENV_PREFIX)),
+            )
+            .collect();
+        let actual_names: BTreeSet<&str> = part.keys().map(String::as_str).collect();
+        assert_eq!(actual_names, expected_names);
+        let value_digest = Digest::of_os_str(OsStr::new("value"));
+        for digest in part.values().flatten() {
+            assert_eq!(*digest, value_digest);
         }
-        let expected = declared.len() + ALWAYS_KEYED_ENV.len() + 1;
-        assert!(part.len() <= expected, "{part:?}");
+    }
+
+    // Property: the same digest under the same name in a different part gives a different key.
+    #[hegel::test]
+    fn moving_an_entry_between_parts_changes_the_key(tc: TestCase) {
+        let parts = draw_parts(&tc);
+        let name = tc.draw(gs::text().max_size(8));
+        let digest = draw_digest(&tc);
+        let mut in_spawned = parts.clone();
+        in_spawned.spawned.insert(name.clone(), digest);
+        let mut in_inputs = parts.clone();
+        in_inputs.inputs.insert(name.clone(), digest);
+        let mut in_env = parts;
+        in_env.inputs.remove(&name);
+        in_env.env.insert(name.clone(), Some(digest));
+        in_inputs.spawned.remove(&name);
+        in_spawned.inputs.remove(&name);
+        in_spawned.env.remove(&name);
+        in_inputs.env.remove(&name);
+
+        assert_ne!(in_spawned.key(), in_inputs.key());
+        assert_ne!(in_inputs.key(), in_env.key());
     }
 
     // Property: a digest is 64 hex digits in JSON and reads back unchanged.

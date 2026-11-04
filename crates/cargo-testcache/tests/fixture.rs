@@ -301,6 +301,58 @@ fn changing_a_declared_input_reruns_what_it_covers(tc: TestCase) {
     );
 }
 
+// Property: an `[env]` table in Cargo's configuration reaches every test binary, as under
+// `cargo test`, though the direct runner cannot apply it (the run falls back to Cargo), and
+// changing it reruns every binary. Checked with the table in `.cargo/config.toml` and given as
+// `--config`, each on a fresh fixture, in a drawn order.
+#[hegel::test(test_cases = 2)]
+fn cargo_config_env_reaches_the_tests_and_is_keyed(tc: TestCase) {
+    let reversed = tc.draw(gs::booleans());
+    let first = tc.draw(gs::integers::<u32>()).to_string();
+    let second = format!("{first}-changed");
+    for in_file in in_order([true, false], reversed) {
+        let fixture = Fixture::new();
+        let run = |value: &str| {
+            let setting = format!("FIXTURE_CFG = \"{value}\"");
+            let config_arg = format!("env.{setting}");
+            let args: Vec<&str> = if in_file {
+                fs::create_dir_all(fixture.root.join(".cargo")).expect("create .cargo");
+                fixture.write(".cargo/config.toml", &format!("[env]\n{setting}\n"));
+                Vec::new()
+            } else {
+                vec!["--config", &config_arg]
+            };
+            let output = fixture.testcache(&args, &[("FIXTURE_CFG_EXPECTED", OsStr::new(value))]);
+            assert!(
+                output.status.success(),
+                "in a file: {in_file}, value {value}:\n{}",
+                stderr(&output)
+            );
+            fixture.take_runs()
+        };
+
+        assert_eq!(run(&first), names(&ALL), "first run, in a file: {in_file}");
+        assert_eq!(
+            run(&first),
+            BTreeSet::new(),
+            "unchanged, in a file: {in_file}"
+        );
+        assert_eq!(run(&second), names(&ALL), "changed, in a file: {in_file}");
+        // Some binaries run, so each runs through `cargo test` on its own.
+        fixture.write("alpha/fixtures/extra.txt", &second);
+        assert_eq!(
+            run(&second),
+            names(&["alpha", "reads_input"]),
+            "one input changed, in a file: {in_file}"
+        );
+        assert_eq!(
+            run(&second),
+            BTreeSet::new(),
+            "recorded, in a file: {in_file}"
+        );
+    }
+}
+
 // Property (9.4): a failing binary is not recorded, so it runs again, and a passing one is, so
 // it does not. Every binary starts out failing and is fixed one at a time, in a drawn order:
 // each run then runs exactly the binaries that have not passed yet.

@@ -10,6 +10,8 @@ use std::path::PathBuf;
 /// - `FIXTURE_RUN_LOG`: appends this binary's name and a newline.
 /// - `FIXTURE_DUMP_DIR`: writes `<name>.env`, the working directory and the environment.
 /// - `FIXTURE_FAIL_DIR`: panics if a file named after this binary exists there.
+/// - `FIXTURE_CFG_EXPECTED`: panics unless `FIXTURE_CFG`, which a test sets through Cargo's
+///   `[env]` configuration, has this value.
 pub fn record() {
     let name = binary_name();
     if let Some(log) = std::env::var_os("FIXTURE_RUN_LOG") {
@@ -28,6 +30,13 @@ pub fn record() {
         let cwd = std::env::current_dir().expect("working directory");
         let dump = format!("cwd={}\n{}\n", cwd.display(), vars.join("\n"));
         fs::write(PathBuf::from(dir).join(format!("{name}.env")), dump).expect("write the dump");
+    }
+    if let Some(expected) = std::env::var_os("FIXTURE_CFG_EXPECTED") {
+        assert_eq!(
+            std::env::var_os("FIXTURE_CFG"),
+            Some(expected),
+            "{name} sees Cargo's [env] configuration"
+        );
     }
     if let Some(dir) = std::env::var_os("FIXTURE_FAIL_DIR") {
         assert!(

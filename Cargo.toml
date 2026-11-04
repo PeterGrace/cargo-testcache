@@ -47,6 +47,9 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 # Library error enums (`#[derive(Error)]`).
 thiserror = "2.0.21"
+# Parsing Cargo's configuration files, to see whether they set `[env]`. Only the parser: no
+# writer (`display`).
+toml = { version = "1.2.0", default-features = false, features = ["std", "serde", "parse"] }
 tracing = "0.1.44"
 # `json` adds the JSON log format; `env-filter` reads `RUST_LOG`.
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }

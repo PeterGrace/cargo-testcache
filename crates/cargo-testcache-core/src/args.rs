@@ -292,16 +292,42 @@ impl CargoArgs {
     ///
     /// The value, or `None` when the flag is absent or has no value.
     pub fn value(&self, flag: &str) -> Option<&OsStr> {
-        let mut found = None;
+        // `flatten` on an `Option<Option<_>>` drops one layer: a trailing `--flag` with no value
+        // is the last occurrence, and gives `None`.
+        self.occurrences(flag).last().flatten()
+    }
+
+    /// The values of every occurrence of `flag`, as `--flag value` or `--flag=value`, in order.
+    ///
+    /// # Arguments
+    ///
+    /// * `flag` - Such as `--config`.
+    ///
+    /// # Returns
+    ///
+    /// The values; an occurrence without a value is left out.
+    pub fn values<'a>(&'a self, flag: &str) -> impl Iterator<Item = &'a OsStr> {
+        // `flatten` over `Option`s keeps the `Some` values, like `[v for v in xs if v is not None]`.
+        self.occurrences(flag).flatten()
+    }
+
+    /// Each occurrence of `flag`, with its value or `None` when a separate value is missing.
+    // Edition 2024: the returned iterator borrows both `self` and `flag`, without saying so.
+    fn occurrences<'a>(&'a self, flag: &str) -> impl Iterator<Item = Option<&'a OsStr>> {
         let mut iter = self.0.iter();
-        while let Some(arg) = iter.next() {
-            if arg == flag {
-                found = iter.next().map(OsString::as_os_str);
-            } else if let Some(value) = attached_value(arg, flag) {
-                found = Some(value);
+        // `from_fn` makes an iterator from a closure that returns the next item, like a Python
+        // generator written as a function called repeatedly; `None` ends it.
+        std::iter::from_fn(move || {
+            while let Some(arg) = iter.next() {
+                if arg == flag {
+                    return Some(iter.next().map(OsString::as_os_str));
+                }
+                if let Some(value) = attached_value(arg, flag) {
+                    return Some(Some(value));
+                }
             }
-        }
-        found
+            None
+        })
     }
 
     /// The first argument that makes `cargo test` run unchanged (`--no-run`, `--doc`).
@@ -462,7 +488,8 @@ mod tests {
         );
     }
 
-    // Property: `value` finds the last occurrence, in either `--flag value` or `--flag=value`.
+    // Property: `value` finds the last occurrence, and `values` every one in order, in either
+    // `--flag value` or `--flag=value`.
     #[hegel::test]
     fn value_returns_the_last_occurrence(tc: TestCase) {
         let occurrences = tc.draw(
@@ -489,6 +516,12 @@ mod tests {
             cargo.value("--target-dir").map(OsStr::to_os_string),
             expected
         );
+        let every: Vec<&OsStr> = cargo.values("--target-dir").collect();
+        let expected_every: Vec<&OsStr> = occurrences
+            .iter()
+            .map(|(_, value)| OsStr::new(value.as_str()))
+            .collect();
+        assert_eq!(every, expected_every);
     }
 
     /// Package and target selection arguments, each with a value where one is needed, and

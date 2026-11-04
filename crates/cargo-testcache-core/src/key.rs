@@ -21,7 +21,7 @@ use sha2::{Digest as _, Sha256};
 
 /// Bumped whenever [`KeyParts::key`] changes how it encodes the parts, so a key computed one
 /// way is never compared with one computed another way.
-pub const KEY_FORMAT_VERSION: u32 = 1;
+pub const KEY_FORMAT_VERSION: u32 = 2;
 
 /// Environment variables that are part of every key, besides those the configuration names.
 pub const ALWAYS_KEYED_ENV: [&str; 2] = ["RUST_TEST_THREADS", "RUST_MIN_STACK"];
@@ -149,6 +149,9 @@ pub struct KeyParts {
     pub env: BTreeMap<String, Option<Digest>>,
     /// The arguments after `--` (part 5).
     pub args: Digest,
+    /// Cargo's configuration files and `--config` values, which can change what a test binary
+    /// sees (`[env]`, a runner) without changing the binary (part 7).
+    pub cargo_config: Digest,
 }
 
 impl KeyParts {
@@ -193,6 +196,7 @@ impl KeyParts {
             encoder.field(value.as_ref().map_or(&[][..], |digest| &digest.0[..]));
         }
         encoder.field(&self.args.0);
+        encoder.field(&self.cargo_config.0);
         encoder.finish()
     }
 }
@@ -302,10 +306,14 @@ pub(crate) mod testing {
                 .map(|name| (name, tc.draw(gs::booleans()).then(|| draw_digest(tc))))
                 .collect(),
             args: draw_digest(tc),
+            cargo_config: draw_digest(tc),
         }
     }
 
-    /// Changes exactly one part of `parts`, chosen by `which` (0 to 5).
+    /// How many parts [`mutate_one_part`] can change.
+    pub(crate) const PART_COUNT: u8 = 7;
+
+    /// Changes exactly one part of `parts`, chosen by `which` (below [`PART_COUNT`]).
     pub(crate) fn mutate_one_part(parts: &mut KeyParts, which: u8, name: String) {
         let rehash = |digest: &mut Digest| *digest = Digest::of_bytes(&digest.0);
         match which {
@@ -321,14 +329,15 @@ pub(crate) mod testing {
                 };
                 parts.env.insert(name, flipped);
             }
-            _ => rehash(&mut parts.args),
+            5 => rehash(&mut parts.args),
+            _ => rehash(&mut parts.cargo_config),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{draw_digest, draw_parts, mutate_one_part};
+    use super::testing::{PART_COUNT, draw_digest, draw_parts, mutate_one_part};
     use super::*;
 
     use std::collections::BTreeSet;
@@ -355,7 +364,7 @@ mod tests {
     #[hegel::test]
     fn changing_any_one_part_changes_the_key(tc: TestCase) {
         let parts = draw_parts(&tc);
-        let which = tc.draw(gs::integers::<u8>().max_value(5));
+        let which = tc.draw(gs::integers::<u8>().max_value(PART_COUNT - 1));
         let name = tc.draw(gs::text().max_size(8));
         let mut changed = parts.clone();
 

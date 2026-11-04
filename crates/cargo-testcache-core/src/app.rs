@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rayon::prelude::*;
 
 use crate::args::CargoArgs;
+use crate::cargo_config::CargoConfig;
 use crate::discover::{self, Build, TargetKind, TestBinary};
 use crate::error::{Error, Result};
 use crate::exec::{self, LIBRARY_PATH_VAR, RunContext, Toolchain};
@@ -111,10 +112,12 @@ pub fn run(options: &Options) -> Result<Outcome> {
         return Ok(Outcome::Exited(status.code().unwrap_or(FAILURE_CODE)));
     }
     let mut store = Store::open(&workspace.cache_dir())?;
+    let cargo_config = CargoConfig::load(&options.cargo_args);
     let session = Session {
         cargo: &cargo,
         workspace: &workspace,
         build: &build,
+        cargo_config: &cargo_config,
         options,
     };
     let planned = session.plan(&store)?;
@@ -157,6 +160,8 @@ struct Session<'a> {
     cargo: &'a Path,
     workspace: &'a Workspace,
     build: &'a Build,
+    /// Read once per run; its digest is part of every binary's key.
+    cargo_config: &'a CargoConfig,
     options: &'a Options,
 }
 
@@ -168,6 +173,7 @@ struct KeyContext<'a> {
     environment: &'a BTreeMap<OsString, OsString>,
     tool: String,
     args: Digest,
+    cargo_config: std::result::Result<Digest, String>,
 }
 
 // `Session<'_>`: the impl works for a `Session` borrowing for any lifetime; `'_` lets the
@@ -203,6 +209,7 @@ impl Session<'_> {
             environment: &environment,
             tool: KeyParts::tool_id(),
             args: KeyParts::args_digest(&self.options.test_args),
+            cargo_config: self.cargo_config.digest(),
         };
         Ok(binaries
             .into_iter()
@@ -230,9 +237,14 @@ impl Session<'_> {
             .iter()
             .filter(|planned| matches!(planned.decision, Decision::Run(_)))
             .count();
+        // Only Cargo applies a configuration's `[env]` table to the binaries it runs.
+        let config_env = !options.via_cargo && to_run > 0 && self.cargo_config.sets_env();
+        if config_env {
+            tracing::info!("an [env] table in Cargo's configuration forces the via-cargo runner");
+        }
         // The toolchain is needed only by the direct runner, and to see whether a configured
         // target runner rules the direct runner out; `--via-cargo` never needs rustc.
-        let toolchain = if to_run > 0 && !options.via_cargo {
+        let toolchain = if to_run > 0 && !options.via_cargo && !config_env {
             Some(Toolchain::detect(self.cargo)?)
         } else {
             None
@@ -243,7 +255,7 @@ impl Session<'_> {
         if runner_configured {
             tracing::info!("a configured target runner forces the via-cargo runner");
         }
-        let via_cargo = options.via_cargo || runner_configured;
+        let via_cargo = options.via_cargo || config_env || runner_configured;
         if via_cargo && to_run == planned.len() && to_run > 0 && !options.no_doc {
             return self.run_whole(store, planned);
         }
@@ -541,6 +553,7 @@ fn key_parts(
         inputs: context.inputs.for_package(&binary.id.package_id)?,
         env: key::env_part(context.workspace.env_names(package), context.environment),
         args: context.args,
+        cargo_config: context.cargo_config.clone()?,
     })
 }
 

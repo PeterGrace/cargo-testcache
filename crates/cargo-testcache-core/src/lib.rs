@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod args;
+pub mod cargo_config;
 pub mod config;
 pub mod discover;
 pub mod error;

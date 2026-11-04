@@ -59,6 +59,8 @@ pub enum Change {
     Env(String),
     /// The arguments after `--`.
     Args,
+    /// Cargo's configuration files or `--config` values.
+    CargoConfig,
 }
 
 /// The summary line's groups of run reasons.
@@ -111,6 +113,7 @@ impl fmt::Display for Change {
             Self::Input(path) => write!(formatter, "input {path} changed"),
             Self::Env(name) => write!(formatter, "env {name} changed"),
             Self::Args => formatter.write_str("arguments changed"),
+            Self::CargoConfig => formatter.write_str("cargo configuration changed"),
         }
     }
 }
@@ -202,6 +205,9 @@ pub fn changes(old: &KeyParts, new: &KeyParts) -> Vec<Change> {
     if old.args != new.args {
         changes.push(Change::Args);
     }
+    if old.cargo_config != new.cargo_config {
+        changes.push(Change::CargoConfig);
+    }
     changes
 }
 
@@ -262,7 +268,7 @@ mod tests {
 
     use crate::discover::TargetKind;
     use crate::key::Digest;
-    use crate::key::testing::{draw_parts, mutate_one_part};
+    use crate::key::testing::{PART_COUNT, draw_parts, mutate_one_part};
 
     fn target() -> TargetId {
         TargetId {
@@ -277,7 +283,7 @@ mod tests {
             .expect("a pass is recorded")
     }
 
-    /// The one change `mutate_one_part` makes for `which` (0 to 5), named `name`.
+    /// The one change `mutate_one_part` makes for `which` (below `PART_COUNT`), named `name`.
     fn expected_change(which: u8, name: &str) -> Change {
         match which {
             0 => Change::Tool,
@@ -285,7 +291,8 @@ mod tests {
             2 => Change::Spawned(name.to_owned()),
             3 => Change::Input(name.to_owned()),
             4 => Change::Env(name.to_owned()),
-            _ => Change::Args,
+            5 => Change::Args,
+            _ => Change::CargoConfig,
         }
     }
 
@@ -295,7 +302,7 @@ mod tests {
     fn skipped_exactly_when_the_key_is_recorded(tc: TestCase) {
         let parts = draw_parts(&tc);
         let history = tc.draw(gs::integers::<u8>().max_value(2));
-        let which = tc.draw(gs::integers::<u8>().max_value(5));
+        let which = tc.draw(gs::integers::<u8>().max_value(PART_COUNT - 1));
         let name = tc.draw(gs::text().max_size(6));
         let previous = match history {
             0 => None,
@@ -325,7 +332,7 @@ mod tests {
     fn policies_and_unknown_keys_force_a_run(tc: TestCase) {
         let parts = draw_parts(&tc);
         let history = tc.draw(gs::integers::<u8>().max_value(2));
-        let which = tc.draw(gs::integers::<u8>().max_value(5));
+        let which = tc.draw(gs::integers::<u8>().max_value(PART_COUNT - 1));
         let name = tc.draw(gs::text().max_size(6));
         let previous = match history {
             0 => None,
@@ -392,7 +399,7 @@ mod tests {
     #[hegel::test]
     fn changes_name_the_changed_part(tc: TestCase) {
         let old = draw_parts(&tc);
-        let which = tc.draw(gs::integers::<u8>().max_value(5));
+        let which = tc.draw(gs::integers::<u8>().max_value(PART_COUNT - 1));
         let name = tc.draw(gs::text().max_size(6));
         let mut new = old.clone();
         mutate_one_part(&mut new, which, name.clone());
@@ -401,6 +408,10 @@ mod tests {
         assert_eq!(
             Change::Input(name.clone()).to_string(),
             format!("input {name} changed")
+        );
+        assert_eq!(
+            Change::CargoConfig.to_string(),
+            "cargo configuration changed"
         );
     }
 

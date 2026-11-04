@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::args::CargoArgs;
 use crate::error::{Error, Result};
 
+/// The arguments that make `cargo test` build without running and print its JSON messages.
+pub const NO_RUN_ARGS: [&str; 2] = ["--no-run", "--message-format=json-render-diagnostics"];
+
 /// Prefixes Cargo puts on a build script's `rustc-link-search` paths.
 const LINK_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
 
@@ -152,6 +155,23 @@ struct BuildScriptMessage {
 }
 
 impl Build {
+    /// Whether this build produced a test binary at a path. Cargo puts a hash of the features,
+    /// profile and dependencies in each executable's name, so the same path means the same
+    /// build of the target.
+    ///
+    /// # Arguments
+    ///
+    /// * `executable` - The test executable's path.
+    ///
+    /// # Returns
+    ///
+    /// `true` if one of [`Build::binaries`] has that executable.
+    pub fn has_test_executable(&self, executable: &Path) -> bool {
+        self.binaries
+            .iter()
+            .any(|binary| binary.executable == executable)
+    }
+
     /// Keeps a build script's library directories and the output its package's binaries get.
     fn add_build_script(&mut self, script: BuildScriptMessage) {
         self.linked_paths
@@ -207,13 +227,26 @@ impl Build {
 ///
 /// When Cargo cannot be started, its output cannot be read, or waiting for it fails.
 pub fn build(cargo: &Path, args: &CargoArgs) -> Result<(ExitStatus, Build)> {
-    let mut child = Command::new(cargo)
-        .args([
-            "test",
-            "--no-run",
-            "--message-format=json-render-diagnostics",
-        ])
-        .args(args.as_slice())
+    let mut command = Command::new(cargo);
+    command.arg("test").args(NO_RUN_ARGS).args(args.as_slice());
+    build_with(command)
+}
+
+/// Runs a `cargo test` command that has [`NO_RUN_ARGS`], and reads what it built.
+///
+/// # Arguments
+///
+/// * `command` - The command; its stdout is replaced with a pipe.
+///
+/// # Returns
+///
+/// Cargo's exit status and what it built. Diagnostics and progress go straight to stderr.
+///
+/// # Errors
+///
+/// When Cargo cannot be started, its output cannot be read, or waiting for it fails.
+pub fn build_with(mut command: Command) -> Result<(ExitStatus, Build)> {
+    let mut child = command
         .stdout(Stdio::piped())
         .spawn()
         .map_err(Error::io("running cargo test --no-run"))?;
@@ -437,6 +470,28 @@ mod tests {
             );
         }
         assert_eq!(build.build_scripts, expected_scripts);
+    }
+
+    // Property: a build has a test executable exactly when one of its test binaries was built
+    // there; a package bin at that path does not count.
+    #[hegel::test]
+    fn test_executables_are_found_by_path(tc: TestCase) {
+        let fed: Vec<Fed> = (0..tc.draw(gs::integers::<usize>().max_value(6)))
+            .map(|_| draw_artifact(&tc))
+            .collect();
+        let probe = draw_artifact(&tc);
+        let output: Vec<String> = fed.iter().map(line).collect();
+        let build = parse(Cursor::new(output.join("\n"))).expect("parse");
+        let path = PathBuf::from(format!("/exe/{}-{}", probe.package, probe.name));
+
+        let expected = fed.iter().any(|f| {
+            f.test
+                && f.executable
+                && f.kind != "custom-build"
+                && f.package == probe.package
+                && f.name == probe.name
+        });
+        assert_eq!(build.has_test_executable(&path), expected);
     }
 
     // Property: a `kind=` prefix is stripped from a linked path; anything else is kept whole.

@@ -23,6 +23,10 @@ use crate::workspace::{Package, Workspace};
 /// The exit status `cargo test` uses for failures, used when a process died without one.
 const FAILURE_CODE: i32 = 101;
 
+/// Why a via-cargo pass of one target is not recorded.
+const DIFFERENT_BINARY: &str = "Cargo builds a different binary for this target alone (feature \
+    unification); the direct runner (without --via-cargo) runs the hashed one";
+
 /// A file's digest, or why it could not be read. Spelled out because the crate's `Result`
 /// alias fixes the error type to [`Error`], and these errors are messages for a run reason.
 type FileDigest = std::result::Result<Digest, String>;
@@ -295,22 +299,42 @@ impl Session<'_> {
                         detail.as_deref(),
                     ));
                     progress.set_message(format!("running {}", planned.label));
-                    let mut command = match &context {
-                        Some(context) => {
-                            exec::direct_command(planned.binary, context, &options.test_args)?
-                        }
-                        None => exec::via_cargo_command(
-                            self.cargo,
-                            planned.binary,
-                            &options.cargo_args,
-                            &options.test_args,
+                    // The direct runner runs the hashed executable itself; through Cargo, the
+                    // target alone may build a different one, whose pass the key cannot vouch for.
+                    let (mut command, same_binary) = match &context {
+                        Some(context) => (
+                            exec::direct_command(planned.binary, context, &options.test_args)?,
+                            true,
+                        ),
+                        None => (
+                            exec::via_cargo_command(
+                                self.cargo,
+                                planned.binary,
+                                &options.cargo_args,
+                                &options.test_args,
+                            ),
+                            progress.suspended(|| {
+                                exec::via_cargo_builds_same_binary(
+                                    self.cargo,
+                                    planned.binary,
+                                    &options.cargo_args,
+                                )
+                            })?,
                         ),
                     };
                     let outcome = progress.suspended(|| exec::run(&mut command))?;
                     let passed = outcome.passed();
                     tally.ran(reason.category(), passed);
-                    // Only a pass with a computable key is recorded.
-                    if let Ok(parts) = planned.parts
+                    if passed && !same_binary {
+                        progress.line(&report::status_line(
+                            "Not recorded",
+                            &planned.label,
+                            Some(DIFFERENT_BINARY),
+                        ));
+                    }
+                    // Only a pass of the hashed executable with a computable key is recorded.
+                    if same_binary
+                        && let Ok(parts) = planned.parts
                         && let Some(record) = plan::pass_record(
                             &planned.binary.id,
                             parts,
@@ -341,6 +365,10 @@ impl Session<'_> {
 
     /// The via-cargo shortcut when nothing is cached: one plain `cargo test` (doc tests
     /// included), recording every binary if it passes.
+    ///
+    /// This runs the user's own arguments, unchanged, so Cargo selects the same packages and
+    /// unifies features as the `--no-run` build that was hashed did: it runs the hashed
+    /// executables, and needs no per-target build check.
     fn run_whole(&self, store: &mut Store, planned: Vec<Planned<'_>>) -> Result<Outcome> {
         let options = self.options;
         if options.explain {

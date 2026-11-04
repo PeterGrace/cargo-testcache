@@ -19,7 +19,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::args::CargoArgs;
-use crate::discover::{Build, TargetKind, TestBinary};
+use crate::discover::{self, Build, NO_RUN_ARGS, TargetKind, TestBinary};
 use crate::error::{Error, Result};
 use crate::workspace::{Package, Workspace};
 
@@ -427,9 +427,73 @@ pub fn via_cargo_command(
     cargo_args: &CargoArgs,
     test_args: &[OsString],
 ) -> Command {
+    let mut command = one_target_command(cargo, binary, cargo_args, &[]);
+    if !test_args.is_empty() {
+        command.arg("--").args(test_args);
+    }
+    command
+}
+
+/// The command that builds, without running, what [`via_cargo_command`] would run.
+///
+/// # Arguments
+///
+/// * `cargo` - The cargo executable.
+/// * `binary` - The test binary.
+/// * `cargo_args` - The user's cargo arguments; package and target selection are replaced.
+///
+/// # Returns
+///
+/// `cargo test --no-run --message-format=json-render-diagnostics <args> --package <id>
+/// <target selector>`.
+pub fn via_cargo_build_command(
+    cargo: &Path,
+    binary: &TestBinary,
+    cargo_args: &CargoArgs,
+) -> Command {
+    one_target_command(cargo, binary, cargo_args, &NO_RUN_ARGS)
+}
+
+/// Whether running one target through `cargo test` runs the executable that was hashed.
+///
+/// Selecting one package and target changes feature unification: a feature that another
+/// selected package turns on (through a dev-dependency, say) is off when the target is
+/// built alone, and the executable built is then a different one, with a different path.
+///
+/// # Arguments
+///
+/// * `cargo` - The cargo executable.
+/// * `binary` - The test binary that was hashed.
+/// * `cargo_args` - The user's cargo arguments.
+///
+/// # Returns
+///
+/// `true` when the one-target build succeeds and produces `binary`'s executable.
+///
+/// # Errors
+///
+/// When Cargo cannot be started or its output cannot be read.
+pub fn via_cargo_builds_same_binary(
+    cargo: &Path,
+    binary: &TestBinary,
+    cargo_args: &CargoArgs,
+) -> Result<bool> {
+    let (status, build) = discover::build_with(via_cargo_build_command(cargo, binary, cargo_args))?;
+    Ok(status.success() && build.has_test_executable(&binary.executable))
+}
+
+/// `cargo test <extra> <args> --package <id> <target selector>`, the user's package and target
+/// selection left out.
+fn one_target_command(
+    cargo: &Path,
+    binary: &TestBinary,
+    cargo_args: &CargoArgs,
+    extra: &[&str],
+) -> Command {
     let mut command = Command::new(cargo);
     command
         .arg("test")
+        .args(extra)
         .args(cargo_args.without_selection().as_slice())
         .arg("--package")
         .arg(&binary.id.package_id);
@@ -441,9 +505,6 @@ pub fn via_cargo_command(
         TargetKind::Bench => command.args(["--bench", name]),
         TargetKind::Example => command.args(["--example", name]),
     };
-    if !test_args.is_empty() {
-        command.arg("--").args(test_args);
-    }
     command
 }
 
@@ -803,7 +864,8 @@ mod tests {
     }
 
     // Property: the via-cargo command selects exactly the binary's target, keeps the other
-    // cargo arguments, and passes the test arguments after `--`.
+    // cargo arguments, and passes the test arguments after `--`; the command that checks what
+    // it builds is the same, with `--no-run` and JSON messages and without test arguments.
     #[hegel::test]
     fn via_cargo_commands_select_one_target(tc: TestCase) {
         let kind = tc.draw(gs::sampled_from(&KINDS).print_as_debug());
@@ -834,6 +896,12 @@ mod tests {
             .chain(selector)
             .map(OsStr::new)
             .collect();
+        let build_command =
+            via_cargo_build_command(Path::new("cargo"), &binary(kind, None), &cargo_args);
+        let build_args: Vec<&OsStr> = build_command.get_args().collect();
+        let mut expected_build = expected.clone();
+        expected_build.splice(1..1, NO_RUN_ARGS.map(OsStr::new));
+        assert_eq!(build_args, expected_build);
         if !test_args.is_empty() {
             expected.push(OsStr::new("--"));
             expected.extend(test_args.iter().map(OsString::as_os_str));

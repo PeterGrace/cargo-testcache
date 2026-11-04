@@ -138,6 +138,25 @@ impl Fixture {
         fs::write(self.root.join(relative), contents).expect("write a fixture file");
     }
 
+    /// Replaces the one occurrence of `from` in a fixture file with `to`.
+    fn replace(&self, relative: &str, from: &str, to: &str) {
+        let path = self.root.join(relative);
+        let contents = fs::read_to_string(&path).expect("read a fixture file");
+        assert_eq!(
+            contents.matches(from).count(),
+            1,
+            "{relative} has {from:?} once"
+        );
+        fs::write(&path, contents.replace(from, to)).expect("write a fixture file");
+    }
+
+    /// Appends to a fixture file.
+    fn append(&self, relative: &str, text: &str) {
+        let path = self.root.join(relative);
+        let contents = fs::read_to_string(&path).expect("read a fixture file");
+        fs::write(&path, contents + text).expect("write a fixture file");
+    }
+
     /// Sets the `STAMP` constant in a fixture source file, which must define exactly one.
     fn set_stamp(&self, relative: &str, stamp: u32) {
         let path = self.root.join(relative);
@@ -350,6 +369,58 @@ fn cargo_config_env_reaches_the_tests_and_is_keyed(tc: TestCase) {
             BTreeSet::new(),
             "recorded, in a file: {in_file}"
         );
+    }
+}
+
+// Property: under `--via-cargo`, a binary that Cargo builds differently when its target is
+// selected alone runs but is not recorded, so it runs again; one Cargo builds the same way is
+// recorded. Here gamma's dev-dependency turns on probe's feature `x`, which feature unification
+// applies to the whole workspace's build but not to `cargo test -p alpha --test reads_input`
+// or `-p beta --test spawns_tool`; gamma's own lib test gets the feature either way. Each of
+// the three is changed alone, in turn on one fixture, in a drawn order.
+#[hegel::test(test_cases = 2)]
+fn via_cargo_records_only_the_binary_it_hashed(tc: TestCase) {
+    let rotation = tc.draw(gs::integers::<usize>().max_value(2));
+    let stamp = tc.draw(gs::integers::<u32>());
+    let fixture = Fixture::new();
+    fixture.append("probe/Cargo.toml", "\n[features]\nx = []\n");
+    fixture.replace(
+        "gamma/Cargo.toml",
+        "probe = { path = \"../probe\" }",
+        "probe = { path = \"../probe\", features = [\"x\"] }",
+    );
+    fixture.testcache_ok(&[]);
+    assert_eq!(fixture.take_runs(), names(&ALL), "the first run");
+
+    let mut variants = [
+        ("alpha/tests/reads_input.rs", "reads_input", false),
+        ("beta/tests/spawns_tool.rs", "spawns_tool", false),
+        ("gamma/src/lib.rs", "gamma", true),
+    ];
+    variants.rotate_left(rotation);
+    for (file, name, recorded) in variants {
+        // A new test changes this one binary and no other.
+        fixture.append(
+            file,
+            &format!("\n#[test]\nfn stamp_{stamp}() {{\n    println!(\"{stamp}\");\n}}\n"),
+        );
+        let output = fixture.testcache_ok(&["--via-cargo"]);
+        assert_eq!(fixture.take_runs(), names(&[name]), "after changing {file}");
+        assert_eq!(
+            stderr(&output).contains("Not recorded"),
+            !recorded,
+            "{}",
+            stderr(&output)
+        );
+
+        let expected = if recorded { names(&[]) } else { names(&[name]) };
+        fixture.testcache_ok(&["--via-cargo"]);
+        assert_eq!(fixture.take_runs(), expected, "via cargo again, {name}");
+        // The direct runner runs the hashed executable, so it records the pass.
+        fixture.testcache_ok(&[]);
+        assert_eq!(fixture.take_runs(), expected, "directly, {name}");
+        fixture.testcache_ok(&[]);
+        assert_eq!(fixture.take_runs(), BTreeSet::new(), "recorded, {name}");
     }
 }
 

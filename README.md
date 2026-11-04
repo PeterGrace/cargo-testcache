@@ -39,8 +39,8 @@ spawns = ["myapp-server"]                        # binaries spawned by path, und
 ```
 
 Any change to a `.cargo/config.toml` (in the working directory, its ancestors or `$CARGO_HOME`)
-or to a `--config` argument reruns every binary. When the configuration has an `[env]` table,
-binaries run through `cargo test`, since only Cargo applies it.
+or to a `--config` argument reruns every binary. When the configuration has an `[env]` table or
+a target runner, binaries run through `cargo test`, since only Cargo applies them.
 
 The record lives in `<target-dir>/testcache/passes.jsonl`; `cargo clean` removes it too. Keep a
 plain `cargo test` in CI: the cache is for local iteration.

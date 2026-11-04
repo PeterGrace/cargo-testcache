@@ -154,6 +154,7 @@ Fixed after the final branch review (changelog/2026-11-04-1526-review-fixes.md):
 - Runners configured in `.cargo/config.toml` (`target.<triple>.runner`) are not detected; only
   `CARGO_TARGET_<TRIPLE>_RUNNER` switches to the via-cargo runner. A `--target` given as a
   `.json` spec, `CARGO_BUILD_TARGET` and `build.target` count as the host for that check.
+  (Config-file runners were fixed later; see changelog/2026-11-04-1526-review-fixes.md.)
 - `build_scripts` is keyed by package id, last message wins: if one build runs a package's build
   script twice (host and target, or different features), a test binary could get the other
   run's `OUT_DIR`. Untested.

@@ -104,7 +104,8 @@ prefixes:
 7. **Cargo configuration:** a digest of every Cargo config file Cargo reads for the invocation
    (`.cargo/config.toml` and `.cargo/config` in the working directory and each ancestor, then
    in `$CARGO_HOME`) and every `--config` value, in order. Coarse: any change reruns every
-   binary. An `[env]` table makes the run use the via-cargo runner, since only Cargo applies it.
+   binary. An `[env]` table or a target runner (`target.<triple>.runner`, for any triple or
+   `cfg`) makes the run use the via-cargo runner, since only Cargo applies them.
 
 Two inputs need no key part:
 
@@ -248,7 +249,7 @@ changed input that the key does not cover. The known uncovered inputs are:
 | Binaries relinked between hashing and the end of the run (sources edited before a via-cargo run, which rebuilds; another terminal's `cargo build`) | The executable and spawned binaries are hashed again after a pass, which is recorded only if every digest is unchanged | Nothing known. An input edited during the run is recorded with its old digest, so the next run reruns |
 | A different binary built for one target under `--via-cargo` (feature unification) | Before running one target through Cargo, its `--no-run` build must report the hashed executable, or the pass is not recorded | Nothing known |
 | Shared libraries in build-script link-search directories | Nothing: only executables are hashed | A rebuilt `.so`/`.dylib` that a test loads at runtime, with an unchanged test executable |
-| Cargo configuration (`.cargo/config.toml`, `--config`) | Keyed coarsely: a digest of every config file and `--config` value | Configuration from environment variables (`CARGO_*`), which is not keyed; a runner set in a config file is keyed but not applied by the direct runner |
+| Cargo configuration (`.cargo/config.toml`, `--config`) | Keyed coarsely: a digest of every config file and `--config` value | Configuration from environment variables (`CARGO_*`), which is not keyed. `[env]` and target runners, which the direct runner cannot apply, make the run go through Cargo |
 
 What the tool does when it is unsure:
 

@@ -24,8 +24,19 @@ use crate::workspace::{Package, Workspace};
 const FAILURE_CODE: i32 = 101;
 
 /// Why a via-cargo pass of one target is not recorded.
-const DIFFERENT_BINARY: &str = "Cargo builds a different binary for this target alone (feature \
-    unification); the direct runner (without --via-cargo) runs the hashed one";
+const DIFFERENT_BINARY: &str =
+    "Cargo builds a different binary for this target alone (feature unification)";
+
+/// Why the direct runner cannot be used: Cargo's configuration has an `[env]` table.
+const CONFIG_ENV: &str = "Cargo's configuration has an [env] table, which only Cargo applies";
+
+/// Why the direct runner cannot be used: Cargo's configuration sets a target runner.
+const CONFIG_RUNNER: &str =
+    "Cargo's configuration sets a target runner (target.<triple>.runner), which only Cargo applies";
+
+/// Why the direct runner cannot be used: the environment sets a target runner.
+const ENV_RUNNER: &str =
+    "CARGO_TARGET_<TRIPLE>_RUNNER sets a target runner, which only Cargo applies";
 
 /// Why a pass is not recorded when a binary changed while it ran.
 const CHANGED_DURING_RUN: &str =
@@ -251,25 +262,35 @@ impl Session<'_> {
             .iter()
             .filter(|planned| matches!(planned.decision, Decision::Run(_)))
             .count();
-        // Only Cargo applies a configuration's `[env]` table to the binaries it runs.
-        let config_env = !options.via_cargo && to_run > 0 && self.cargo_config.sets_env();
-        if config_env {
-            tracing::info!("an [env] table in Cargo's configuration forces the via-cargo runner");
-        }
-        // The toolchain is needed only by the direct runner, and to see whether a configured
-        // target runner rules the direct runner out; `--via-cargo` never needs rustc.
-        let toolchain = if to_run > 0 && !options.via_cargo && !config_env {
+        // Why the direct runner cannot be used, if something rules it out: only Cargo applies a
+        // configuration's `[env]` table or a target runner to the binaries it runs.
+        let mut ruled_out = if self.cargo_config.sets_env() {
+            Some(CONFIG_ENV)
+        } else if self.cargo_config.sets_runner() {
+            Some(CONFIG_RUNNER)
+        } else {
+            None
+        };
+        // The toolchain is needed only by the direct runner, and to see whether a runner set in
+        // the environment rules the direct runner out; `--via-cargo` never needs rustc.
+        let toolchain = if to_run > 0 && !options.via_cargo && ruled_out.is_none() {
             Some(Toolchain::detect(self.cargo)?)
         } else {
             None
         };
-        let runner_configured = toolchain
+        if toolchain
             .as_ref()
-            .is_some_and(|toolchain| exec::configured_runner(toolchain, &options.cargo_args));
-        if runner_configured {
-            tracing::info!("a configured target runner forces the via-cargo runner");
+            .is_some_and(|toolchain| exec::configured_runner(toolchain, &options.cargo_args))
+        {
+            ruled_out = Some(ENV_RUNNER);
         }
-        let via_cargo = options.via_cargo || config_env || runner_configured;
+        if let Some(why) = ruled_out
+            && !options.via_cargo
+            && to_run > 0
+        {
+            tracing::info!("using the via-cargo runner: {why}");
+        }
+        let via_cargo = options.via_cargo || ruled_out.is_some();
         if via_cargo && to_run == planned.len() && to_run > 0 && !options.no_doc {
             return self.run_whole(store, planned);
         }
@@ -343,7 +364,7 @@ impl Session<'_> {
                             progress.line(&report::status_line(
                                 "Not recorded",
                                 &planned.label,
-                                Some(DIFFERENT_BINARY),
+                                Some(&different_binary_detail(ruled_out)),
                             ));
                         }
                     } else {
@@ -441,6 +462,25 @@ impl Session<'_> {
         );
         tally.doc_tests(exec::run(&mut command)?.passed());
         Ok(())
+    }
+}
+
+/// The detail of a via-cargo pass that is not recorded because Cargo built a different binary.
+///
+/// # Arguments
+///
+/// * `ruled_out` - Why the direct runner cannot be used, if something rules it out.
+///
+/// # Returns
+///
+/// The detail: it suggests the direct runner, which runs the hashed executable, or says why
+/// that runner cannot be used here.
+fn different_binary_detail(ruled_out: Option<&str>) -> String {
+    match ruled_out {
+        None => format!(
+            "{DIFFERENT_BINARY}; the direct runner (without --via-cargo) runs the hashed one"
+        ),
+        Some(why) => format!("{DIFFERENT_BINARY}; the direct runner cannot be used: {why}"),
     }
 }
 
@@ -681,6 +721,27 @@ mod tests {
     use crate::discover::TargetId;
     use crate::key::testing::{draw_digest, draw_parts};
     use crate::workspace::testing::{ID, metadata};
+
+    // Property: the detail of an unrecorded via-cargo pass suggests the direct runner exactly
+    // when nothing rules it out, and otherwise says what does.
+    #[hegel::test]
+    fn the_hint_names_why_the_direct_runner_cannot_be_used(tc: TestCase) {
+        let ruled_out = tc.draw(gs::optional(
+            gs::sampled_from(&[CONFIG_ENV, CONFIG_RUNNER, ENV_RUNNER]).print_as_debug(),
+        ));
+
+        let detail = different_binary_detail(ruled_out);
+
+        assert!(detail.starts_with(DIFFERENT_BINARY), "{detail}");
+        assert_eq!(
+            detail.contains("without --via-cargo"),
+            ruled_out.is_none(),
+            "{detail}"
+        );
+        if let Some(why) = ruled_out {
+            assert!(detail.ends_with(why), "{detail}");
+        }
+    }
 
     /// How the files are found when they are hashed again after a run.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

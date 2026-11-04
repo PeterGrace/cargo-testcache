@@ -372,6 +372,73 @@ fn cargo_config_env_reaches_the_tests_and_is_keyed(tc: TestCase) {
     }
 }
 
+// Property: a target runner set in Cargo's configuration (for the host triple, for a `cfg`, or
+// by `--config`) is applied to every test binary, which only Cargo can do: the run falls back
+// to the via-cargo runner and says so. The runner is `env FIXTURE_CFG=<value>`, which runs the
+// binary with a variable the fixture checks. Every form is checked in every case, each on a
+// fresh fixture, in a drawn order.
+#[hegel::test(test_cases = 2)]
+fn a_configured_runner_is_applied_through_cargo(tc: TestCase) {
+    let rotation = tc.draw(gs::integers::<usize>().max_value(2));
+    let value = tc.draw(gs::integers::<u32>()).to_string();
+    let host = host_triple();
+    let mut variants = [
+        (true, format!("\"{host}\"")),
+        (true, "'cfg(all())'".to_owned()),
+        (false, "\"cfg(all())\"".to_owned()),
+    ];
+    variants.rotate_left(rotation);
+    for (in_file, target) in variants {
+        let fixture = Fixture::new();
+        let runner = format!("runner = [\"env\", \"FIXTURE_CFG={value}\"]");
+        let config_arg = format!("target.{target}.{runner}");
+        let args: Vec<&str> = if in_file {
+            fs::create_dir_all(fixture.root.join(".cargo")).expect("create .cargo");
+            fixture.write(
+                ".cargo/config.toml",
+                &format!("[target.{target}]\n{runner}\n"),
+            );
+            Vec::new()
+        } else {
+            vec!["--config", &config_arg]
+        };
+        let run = || {
+            let output = fixture.testcache(&args, &[("FIXTURE_CFG_EXPECTED", OsStr::new(&value))]);
+            assert!(
+                output.status.success(),
+                "target {target}, in a file: {in_file}:\n{}",
+                stderr(&output)
+            );
+            (fixture.take_runs(), stderr(&output))
+        };
+
+        let (runs, first) = run();
+        assert_eq!(runs, names(&ALL), "first run, target {target}");
+        assert!(first.contains("using the via-cargo runner"), "{first}");
+        assert_eq!(run().0, BTreeSet::new(), "second run, target {target}");
+        // Some binaries run, so each runs through `cargo test` on its own.
+        fixture.write("alpha/fixtures/extra.txt", &value);
+        assert_eq!(
+            run().0,
+            names(&["alpha", "reads_input"]),
+            "one input changed, target {target}"
+        );
+    }
+}
+
+/// The host's target triple, from `rustc`.
+fn host_triple() -> String {
+    let output = Command::new("rustc")
+        .args(["--print", "host-tuple"])
+        .output()
+        .expect("run rustc");
+    assert!(output.status.success(), "rustc --print host-tuple failed");
+    String::from_utf8(output.stdout)
+        .expect("the triple is UTF-8")
+        .trim()
+        .to_owned()
+}
+
 // Property: under `--via-cargo`, a binary that Cargo builds differently when its target is
 // selected alone runs but is not recorded, so it runs again; one Cargo builds the same way is
 // recorded. Here gamma's dev-dependency turns on probe's feature `x`, which feature unification

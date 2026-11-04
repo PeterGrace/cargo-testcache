@@ -178,9 +178,10 @@ fn resolve_cargo(cargo: &Path, sysroot: &Path) -> Result<PathBuf> {
 /// `CARGO_TARGET_<TRIPLE>_RUNNER` (the triple upper-cased, with `-` and `.` as `_`). The direct
 /// runner cannot reproduce a runner, so the caller falls back to the via-cargo runner.
 ///
-/// Known limitations: a runner set in `.cargo/config.toml` (`target.<triple>.runner` or
-/// `target.'cfg(..)'.runner`) is not detected, and the triple is [`Toolchain::target`]'s, so
-/// with several `--target` flags only the last one's runner is checked.
+/// A runner set in Cargo's configuration (`target.<triple>.runner` or
+/// `target.'cfg(..)'.runner`) is found by [`crate::cargo_config::CargoConfig::sets_runner`]
+/// instead. Known limitation: the triple is [`Toolchain::target`]'s, so with several `--target`
+/// flags only the last one's runner is checked.
 ///
 /// # Arguments
 ///

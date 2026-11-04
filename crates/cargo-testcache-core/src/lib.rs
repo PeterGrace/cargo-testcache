@@ -8,6 +8,7 @@ pub mod args;
 pub mod config;
 pub mod discover;
 pub mod error;
+pub mod exec;
 pub mod inputs;
 pub mod key;
 pub mod manifest;

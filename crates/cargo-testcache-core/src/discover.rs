@@ -97,6 +97,18 @@ pub struct Build {
     pub package_bins: HashMap<String, BTreeMap<String, PathBuf>>,
     /// Build scripts' `rustc-link-search` directories, without their `kind=` prefix.
     pub linked_paths: Vec<PathBuf>,
+    /// Each package's build script output, by package id: what `cargo test` adds to that
+    /// package's own test binaries. When a script ran more than once, the last run wins.
+    pub build_scripts: HashMap<String, BuildScriptOutput>,
+}
+
+/// What a package's build script told Cargo that reaches the package's test binaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildScriptOutput {
+    /// The script's `OUT_DIR`, which `cargo test` also sets for the binaries.
+    pub out_dir: PathBuf,
+    /// Its `rustc-env=NAME=VALUE` variables, in order.
+    pub env: Vec<(String, String)>,
 }
 
 /// The messages this module reads. `#[serde(tag = "reason")]` picks the variant by the
@@ -132,10 +144,27 @@ struct ProfileMessage {
 
 #[derive(Debug, Deserialize)]
 struct BuildScriptMessage {
+    package_id: String,
     linked_paths: Vec<String>,
+    out_dir: PathBuf,
+    // Cargo writes each variable as a two-element JSON array, which serde reads as a tuple.
+    env: Vec<(String, String)>,
 }
 
 impl Build {
+    /// Keeps a build script's library directories and the output its package's binaries get.
+    fn add_build_script(&mut self, script: BuildScriptMessage) {
+        self.linked_paths
+            .extend(script.linked_paths.iter().map(|path| linked_path(path)));
+        self.build_scripts.insert(
+            script.package_id,
+            BuildScriptOutput {
+                out_dir: script.out_dir,
+                env: script.env,
+            },
+        );
+    }
+
     /// Files one artifact as a test binary, a package bin, or neither.
     fn add_artifact(&mut self, artifact: ArtifactMessage) {
         let (Some(kind), Some(executable)) = (
@@ -217,9 +246,7 @@ pub fn parse(output: impl BufRead) -> Result<Build> {
         let line = line.map_err(Error::io("reading cargo's build output"))?;
         match serde_json::from_slice::<Message>(&line) {
             Ok(Message::CompilerArtifact(artifact)) => build.add_artifact(artifact),
-            Ok(Message::BuildScriptExecuted(script)) => build
-                .linked_paths
-                .extend(script.linked_paths.iter().map(|path| linked_path(path))),
+            Ok(Message::BuildScriptExecuted(script)) => build.add_build_script(script),
             Ok(Message::Other) => {}
             Err(error) if serde_json::from_slice::<serde_json::Value>(&line).is_ok() => {
                 // Valid JSON that does not fit our types: Cargo's schema may have changed, and a
@@ -281,6 +308,36 @@ mod tests {
         }
     }
 
+    /// One build script run the test feeds in.
+    #[derive(Debug, Clone)]
+    struct FedScript {
+        package: &'static str,
+        out_dir: String,
+        env: Vec<(String, String)>,
+        linked_paths: Vec<String>,
+    }
+
+    fn draw_script(tc: &TestCase) -> FedScript {
+        let word = || gs::text().alphabet("ab").min_size(1).max_size(3);
+        FedScript {
+            package: tc.draw(gs::sampled_from(&["p1", "p2"]).print_as_debug()),
+            out_dir: format!("/t/{}/out", tc.draw(word())),
+            env: tc.draw(gs::vecs(gs::tuples2(word(), gs::text().max_size(3))).max_size(2)),
+            linked_paths: tc
+                .draw(gs::vecs(word()).max_size(2))
+                .into_iter()
+                .map(|name| format!("native=/t/{name}"))
+                .collect(),
+        }
+    }
+
+    fn script_line(script: &FedScript) -> String {
+        json!({ "reason": "build-script-executed", "package_id": script.package,
+            "linked_libs": [], "linked_paths": script.linked_paths, "cfgs": [],
+            "env": script.env, "out_dir": script.out_dir })
+        .to_string()
+    }
+
     fn line(fed: &Fed) -> String {
         let executable = fed
             .executable
@@ -298,22 +355,22 @@ mod tests {
     }
 
     // Property: test binaries are exactly the artifacts built for test with an executable, in
-    // order; package bins are the non-test `bin` executables; other lines are ignored.
+    // order; package bins are the non-test `bin` executables; build scripts' linked paths are
+    // kept in message order, and each package keeps its last script's out dir and variables;
+    // other lines are ignored.
     #[hegel::test]
     fn messages_yield_binaries_and_package_bins(tc: TestCase) {
         let fed: Vec<Fed> = (0..tc.draw(gs::integers::<usize>().max_value(8)))
             .map(|_| draw_artifact(&tc))
             .collect();
+        let scripts: Vec<FedScript> = (0..tc.draw(gs::integers::<usize>().max_value(4)))
+            .map(|_| draw_script(&tc))
+            .collect();
         let mut output: Vec<String> = fed.iter().map(line).collect();
+        output.extend(scripts.iter().map(script_line));
         output.push(json!({ "reason": "build-finished", "success": true }).to_string());
         output.push("not json".to_owned());
         output.push(json!({ "reason": "compiler-artifact", "package_id": "p1" }).to_string());
-        output.push(
-            json!({ "reason": "build-script-executed", "package_id": "p1",
-                "linked_libs": [], "linked_paths": ["native=/t/native", "/t/plain"],
-                "cfgs": [], "env": [], "out_dir": "/t/out" })
-            .to_string(),
-        );
 
         // Bytes, not a String: a line that is not UTF-8 must be skipped, not abort the parse.
         let mut bytes: Vec<u8> = output.join("\n").into_bytes();
@@ -363,10 +420,23 @@ mod tests {
             bins.iter().map(|f| (f.package, f.name.as_str())).collect();
         let bin_count: usize = build.package_bins.values().map(BTreeMap::len).sum();
         assert_eq!(bin_count, distinct.len());
-        assert_eq!(
-            build.linked_paths,
-            [PathBuf::from("/t/native"), PathBuf::from("/t/plain")]
-        );
+        let expected_paths: Vec<PathBuf> = scripts
+            .iter()
+            .flat_map(|script| &script.linked_paths)
+            .map(|path| PathBuf::from(path.trim_start_matches("native=")))
+            .collect();
+        assert_eq!(build.linked_paths, expected_paths);
+        let mut expected_scripts: HashMap<String, BuildScriptOutput> = HashMap::new();
+        for script in &scripts {
+            expected_scripts.insert(
+                script.package.to_owned(),
+                BuildScriptOutput {
+                    out_dir: PathBuf::from(&script.out_dir),
+                    env: script.env.clone(),
+                },
+            );
+        }
+        assert_eq!(build.build_scripts, expected_scripts);
     }
 
     // Property: a `kind=` prefix is stripped from a linked path; anything else is kept whole.

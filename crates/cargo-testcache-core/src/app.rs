@@ -342,7 +342,7 @@ impl Session<'_> {
                 }
             }
         }
-        eprintln!("testcache: nothing is cached; running cargo test once");
+        eprintln!("testcache: every binary must run; running cargo test once");
         let mut command =
             exec::cargo_test_command(self.cargo, &options.cargo_args, &[], &options.test_args);
         let outcome = exec::run(&mut command)?;

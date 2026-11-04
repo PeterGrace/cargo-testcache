@@ -96,8 +96,9 @@ pub struct SplitArgs {
 ///
 /// # Limits
 ///
-/// The values of Cargo's own options are not consumed, so a Cargo value spelled exactly like one
-/// of the tool's flags is taken as the tool's. Clustered short options (`-hV`) are not taken
+/// When classifying the tool's own options, the values of Cargo's options are not consumed, so a
+/// Cargo value spelled exactly like one of the tool's flags is taken as the tool's. (Recognising
+/// the positional test name does skip them.) Clustered short options (`-hV`) are not taken
 /// apart and go to Cargo. An argument that is not valid UTF-8 and starts with `-` goes to Cargo.
 /// A value-taking Cargo option this tool does not know (a newer Cargo's) has its separate value
 /// taken for the test name; Cargo then fails loudly on the missing value rather than silently

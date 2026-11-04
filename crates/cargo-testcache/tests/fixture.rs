@@ -216,82 +216,107 @@ fn the_second_run_skips_every_binary(tc: TestCase) {
 }
 
 // Property (9.2, 9.6): changing one crate re-runs exactly the binaries that depend on it; for
-// `beta`, the integration test re-runs because the binary it spawns changed.
-#[hegel::test(test_cases = 3)]
+// `beta`, the integration test re-runs because the binary it spawns changed. Every crate is
+// changed in every case, in turn on one fixture, so a derandomized run cannot miss one.
+#[hegel::test(test_cases = 2)]
 fn changing_a_crate_reruns_only_its_dependents(tc: TestCase) {
-    let (file, expected): (&str, &[&str]) = tc.draw(
-        gs::sampled_from(&[
-            ("alpha/src/lib.rs", &["alpha", "gamma", "reads_input"][..]),
-            ("gamma/src/lib.rs", &["gamma"][..]),
-            ("beta/src/main.rs", &["betatool", "spawns_tool"][..]),
-        ])
-        .print_as_debug(),
-    );
     let stamp = tc.draw(gs::integers::<u32>().min_value(1));
     let fixture = Fixture::new();
     fixture.testcache_ok(&[]);
     fixture.take_runs();
 
-    fixture.set_stamp(file, stamp);
-    let output = fixture.testcache_ok(&["--explain"]);
+    let changes: [(&str, &[&str]); 3] = [
+        ("alpha/src/lib.rs", &["alpha", "gamma", "reads_input"]),
+        ("gamma/src/lib.rs", &["gamma"]),
+        ("beta/src/main.rs", &["betatool", "spawns_tool"]),
+    ];
+    for (file, expected) in changes {
+        fixture.set_stamp(file, stamp);
+        let output = fixture.testcache_ok(&["--explain"]);
 
-    assert_eq!(fixture.take_runs(), names(expected));
-    if file.starts_with("beta") {
-        assert!(
-            stderr(&output).contains("spawned bin betatool changed"),
-            "{}",
-            stderr(&output)
+        assert_eq!(
+            fixture.take_runs(),
+            names(expected),
+            "after changing {file}"
         );
+        if file.starts_with("beta") {
+            assert!(
+                stderr(&output).contains("spawned bin betatool changed"),
+                "{}",
+                stderr(&output)
+            );
+        }
     }
 }
 
 // Property (9.3): changing a declared input, or a declared variable, re-runs every binary the
-// declaration covers.
-#[hegel::test(test_cases = 3)]
+// declaration covers. Every kind of change is made in every case, in turn on one fixture.
+#[hegel::test(test_cases = 2)]
 fn changing_a_declared_input_reruns_what_it_covers(tc: TestCase) {
-    let change = tc.draw(gs::sampled_from(&["data", "package input", "env"]).print_as_debug());
     let value = tc.draw(gs::integers::<u32>().min_value(1)).to_string();
     let fixture = Fixture::new();
     fixture.testcache_ok(&[]);
     fixture.take_runs();
 
-    let expected: &[&str] = match change {
-        "data" => {
-            fixture.write("data/value.txt", &value);
-            &ALL
-        }
-        "package input" => {
-            fixture.write("alpha/fixtures/extra.txt", &value);
-            &["alpha", "reads_input"]
-        }
-        _ => &ALL,
-    };
-    let env_value = OsStr::new(&value);
-    let extra_env: &[(&str, &OsStr)] = if change == "env" {
-        &[("FIXTURE_ENV", env_value)]
-    } else {
-        &[]
-    };
-    let output = fixture.testcache(&[], extra_env);
+    fixture.write("data/value.txt", &value);
+    fixture.testcache_ok(&[]);
+    assert_eq!(
+        fixture.take_runs(),
+        names(&ALL),
+        "after changing data/value.txt"
+    );
 
+    fixture.write("alpha/fixtures/extra.txt", &value);
+    fixture.testcache_ok(&[]);
+    assert_eq!(
+        fixture.take_runs(),
+        names(&["alpha", "reads_input"]),
+        "after changing alpha/fixtures/extra.txt"
+    );
+
+    let output = fixture.testcache(&[], &[("FIXTURE_ENV", OsStr::new(&value))]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(fixture.take_runs(), names(expected));
+    assert_eq!(
+        fixture.take_runs(),
+        names(&ALL),
+        "after setting FIXTURE_ENV"
+    );
 }
 
-// Property (9.4): a failing binary is not recorded, so it runs again, and only it.
+// Property (9.4): a failing binary is not recorded, so it runs again, and a passing one is, so
+// it does not. Every binary starts out failing and is fixed one at a time, in a drawn order:
+// each run then runs exactly the binaries that have not passed yet.
 #[hegel::test(test_cases = 2)]
 fn a_failing_binary_runs_again(tc: TestCase) {
-    let failing = tc.draw(gs::sampled_from(&ALL).print_as_debug());
+    let rotation = tc.draw(gs::integers::<usize>().max_value(ALL.len() - 1));
     let fixture = Fixture::new();
-    fixture.fail(failing, true);
-
+    for name in ALL {
+        fixture.fail(name, true);
+    }
     let output = fixture.testcache(&["--no-fail-fast"], &[]);
     assert_eq!(output.status.code(), Some(101), "{}", stderr(&output));
     assert_eq!(fixture.take_runs(), names(&ALL));
 
-    fixture.fail(failing, false);
-    fixture.testcache_ok(&[]);
-    assert_eq!(fixture.take_runs(), names(&[failing]));
+    let mut order = ALL;
+    order.rotate_left(rotation);
+    for (index, fixed) in order.iter().enumerate() {
+        fixture.fail(fixed, false);
+        let output = fixture.testcache(&["--no-fail-fast"], &[]);
+        let still_failing = &order[index + 1..];
+        let expected_code = if still_failing.is_empty() { 0 } else { 101 };
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{}",
+            stderr(&output)
+        );
+        // The one just fixed runs (and passes); the others still fail and run again.
+        assert_eq!(
+            fixture.take_runs(),
+            names(&order[index..]),
+            "after fixing {fixed}"
+        );
+    }
     fixture.testcache_ok(&[]);
     assert_eq!(fixture.take_runs(), BTreeSet::new());
 }
@@ -395,7 +420,9 @@ fn the_direct_runner_matches_cargo_test(tc: TestCase) {
                 .any(|line| line.starts_with("ALPHA_BUILD_ENV=")),
             "{gamma:#?}"
         );
-        let native_on_path = alpha.iter().any(|line| line.contains("/out/native"));
+        let native = Path::new("out").join("native");
+        let native = native.to_string_lossy();
+        let native_on_path = alpha.iter().any(|line| line.contains(native.as_ref()));
         assert_eq!(native_on_path, !separate_build_dir, "{alpha:#?}");
     }
 }

@@ -13,8 +13,11 @@ use std::path::PathBuf;
 pub fn record() {
     let name = binary_name();
     if let Some(log) = std::env::var_os("FIXTURE_RUN_LOG") {
-        let mut file =
-            OpenOptions::new().create(true).append(true).open(log).expect("open the run log");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .expect("open the run log");
         writeln!(file, "{name}").expect("append to the run log");
     }
     if let Some(dir) = std::env::var_os("FIXTURE_DUMP_DIR") {
@@ -27,13 +30,21 @@ pub fn record() {
         fs::write(PathBuf::from(dir).join(format!("{name}.env")), dump).expect("write the dump");
     }
     if let Some(dir) = std::env::var_os("FIXTURE_FAIL_DIR") {
-        assert!(!PathBuf::from(dir).join(&name).exists(), "{name} was told to fail");
+        assert!(
+            !PathBuf::from(dir).join(&name).exists(),
+            "{name} was told to fail"
+        );
     }
 }
 
 /// The test binary's name without Cargo's hash: `alpha` for `alpha-0123abcd`.
 fn binary_name() -> String {
     let exe = std::env::current_exe().expect("current executable");
-    let stem = exe.file_stem().expect("a file name").to_string_lossy().into_owned();
-    stem.rsplit_once('-').map_or_else(|| stem.clone(), |(name, _)| name.to_owned())
+    let stem = exe
+        .file_stem()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
+    stem.rsplit_once('-')
+        .map_or_else(|| stem.clone(), |(name, _)| name.to_owned())
 }

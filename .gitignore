@@ -7,3 +7,6 @@
 .hegel/
 # claims-mcp's lock while it writes claims.json.
 /.claims.json.lock
+# Leftovers from building the fixture workspace in place.
+/crates/cargo-testcache/tests/fixtures/ws/target
+/crates/cargo-testcache/tests/fixtures/ws/Cargo.lock

@@ -10,13 +10,16 @@ set positional-arguments
 default:
     @just --list
 
-# Format the workspace in place.
+# Format the workspace in place, and the fixture workspace the integration tests copy (its own
+# workspace, which `--all` does not reach).
 fmt:
     cargo fmt --all
+    cargo fmt --all --manifest-path crates/cargo-testcache/tests/fixtures/ws/Cargo.toml
 
-# Fail if anything is not formatted.
+# Fail if anything is not formatted, the fixture workspace included.
 fmt-check:
     cargo fmt --all --check
+    cargo fmt --all --check --manifest-path crates/cargo-testcache/tests/fixtures/ws/Cargo.toml
 
 # Lint every crate and target (tests, examples) with warnings as errors.
 clippy:

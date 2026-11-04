@@ -135,6 +135,8 @@ impl Store {
             return Ok(false);
         }
         let _lock = lock(dir)?;
+        // Only the records go: the lock file stays, because removing a lock file other runs may
+        // be waiting on would let two runs hold "the" lock on different inodes.
         let path = dir.join(PASSES_FILE);
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -212,8 +214,11 @@ fn read(path: &Path) -> Result<(HashMap<TargetId, PassRecord>, usize)> {
     Ok((records, lines))
 }
 
-/// Replaces the file with one line per record, through a temporary file and a rename so a crash
-/// never leaves it half written.
+/// Replaces the file with one line per record, through a temporary file and a rename.
+///
+/// The rename is atomic, so a process crash never leaves a half-written file. There is no
+/// `fsync`, so a power loss can at worst leave an unreadable file; that costs only reruns,
+/// because lines that do not parse are dropped on the next open.
 fn rewrite(path: &Path, records: &HashMap<TargetId, PassRecord>) -> Result<()> {
     let mut sorted: Vec<&PassRecord> = records.values().collect();
     sorted.sort_by(|a, b| a.target.cmp(&b.target));
@@ -242,6 +247,12 @@ mod tests {
     use crate::key::testing::draw_parts;
 
     const NAMES: [&str; 3] = ["a", "b", "c"];
+
+    /// Held by tests that spawn a process, and by the test that checks the lock is released.
+    /// Between `fork` and `exec` a child briefly shares every open file of this process,
+    /// including other tests' lock files, and a `flock` lasts until the last copy closes. Without
+    /// this, a spawn in one test can make another test's released lock look still held.
+    static SPAWN_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn target(name: &str) -> TargetId {
         TargetId {
@@ -349,24 +360,37 @@ mod tests {
         );
     }
 
-    // Property (design 9): concurrent writers under the lock never lose or interleave lines.
+    // Property (design 9): concurrent writers under the lock never lose or interleave lines,
+    // even when every open compacts a file with duplicates and the writers share targets.
     #[hegel::test(test_cases = 10)]
     fn concurrent_writers_never_interleave(tc: TestCase) {
+        let seed = draw_records(&tc);
         let per_thread = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
-        let records: Vec<Vec<PassRecord>> = (0..2)
-            .map(|thread| {
+        let batches: Vec<Vec<PassRecord>> = (0..2)
+            .map(|_| {
                 (0..per_thread)
-                    .map(|i| draw_record(&tc, &format!("t{thread}-{i}")))
+                    .map(|_| {
+                        let name = tc.draw(gs::sampled_from(&NAMES).print_as_debug());
+                        draw_record(&tc, name)
+                    })
                     .collect()
             })
             .collect();
         let dir = tempfile::tempdir().expect("temporary directory");
+        // Every seed line twice, so the first open compacts, and so does any later open that
+        // follows an append to a target already in the file.
+        let mut contents = Vec::new();
+        for record in seed.iter().chain(&seed) {
+            serde_json::to_writer(&mut contents, record).expect("serialize");
+            contents.push(b'\n');
+        }
+        fs::write(dir.path().join(PASSES_FILE), contents).expect("write the seed");
 
-        // `thread::scope` lets the threads borrow `records` and `dir`, and joins them all at
-        // the end of the block. `move` copies the two references into each thread.
+        // `thread::scope` lets the threads borrow `batches`, and joins them all at the end of
+        // the block. `move` copies the two references into each thread.
         let path = dir.path();
         std::thread::scope(|scope| {
-            for batch in &records {
+            for batch in &batches {
                 scope.spawn(move || {
                     let mut store = Store::open(path).expect("open");
                     for record in batch {
@@ -376,12 +400,58 @@ mod tests {
             }
         });
 
+        // Which thread wrote last is not deterministic, so each target's final record may be
+        // the last write of either thread; a target neither wrote keeps its newest seed line.
         let store = Store::open(dir.path()).expect("reopen");
-        for record in records.iter().flatten() {
-            assert_eq!(store.lookup(&record.target), Some(record));
+        let seeded = newest(&seed);
+        let mut targets: Vec<TargetId> = seeded.keys().cloned().collect();
+        for name in NAMES {
+            let target = target(name);
+            let candidates: Vec<&PassRecord> = batches
+                .iter()
+                .filter_map(|batch| batch.iter().rev().find(|record| record.target == target))
+                .collect();
+            if candidates.is_empty() {
+                assert_eq!(store.lookup(&target), seeded.get(&target), "{name}");
+                continue;
+            }
+            let found = store.lookup(&target).expect("a written target is recorded");
+            assert!(
+                candidates.contains(&found),
+                "{name}: {found:?} is no thread's last write"
+            );
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
         }
         drop(store);
-        assert_eq!(line_count(dir.path()), 2 * per_thread);
+        assert_eq!(line_count(dir.path()), targets.len());
+    }
+
+    // Property: while a store is open its lock is held, and dropping it releases the lock.
+    #[hegel::test(test_cases = 20)]
+    fn the_lock_is_held_while_the_store_is_open(tc: TestCase) {
+        let _guard = SPAWN_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let records = draw_records(&tc);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut store = Store::open(dir.path()).expect("open");
+        for record in records {
+            store.record(record).expect("record");
+        }
+        let probe = || {
+            OpenOptions::new()
+                .write(true)
+                .open(dir.path().join(LOCK_FILE))
+                .expect("open lock")
+        };
+
+        let held = probe().try_lock();
+        assert!(matches!(held, Err(TryLockError::WouldBlock)), "{held:?}");
+        drop(store);
+        let released = probe().try_lock();
+        assert!(released.is_ok(), "{released:?}");
     }
 
     // Property (design 9): a process spawned while the store is open does not inherit the lock.
@@ -395,6 +465,9 @@ mod tests {
             store.record(record).expect("record");
         }
 
+        let guard = SPAWN_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let output = std::process::Command::new("sh")
             .args([
                 "-c",
@@ -402,8 +475,11 @@ mod tests {
             ])
             .output()
             .expect("run sh");
+        drop(guard);
 
-        let lock_path = dir.path().join(LOCK_FILE);
+        // Compare canonical paths: `readlink` reports resolved paths, so a symlinked temporary
+        // directory would otherwise make the assertion pass vacuously.
+        let lock_path = fs::canonicalize(dir.path().join(LOCK_FILE)).expect("canonical lock path");
         let open_files = String::from_utf8_lossy(&output.stdout);
         assert!(
             !open_files.lines().any(|line| Path::new(line) == lock_path),

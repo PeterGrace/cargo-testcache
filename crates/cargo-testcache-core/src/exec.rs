@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::path::{self, Path, PathBuf};
+use std::path::{self, Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -118,9 +118,11 @@ impl Toolchain {
         Ok(Self::new(sysroot, host.to_owned(), cargo))
     }
 
-    /// The target triple the test binaries are compiled for: `--target`'s value when it is a
-    /// plain triple, else the host. A target given as a `.json` specification counts as the
-    /// host, and so does one set with `CARGO_BUILD_TARGET` or `build.target`.
+    /// The target triple the test binaries are compiled for, as far as the arguments tell:
+    /// `--target`'s value when it is a plain triple, else the host. When `--target` is repeated,
+    /// only the last one counts. A target given as a `.json` specification counts as the host,
+    /// and so does one set with `CARGO_BUILD_TARGET` or `build.target`. A binary's own triple is
+    /// better read from where it was built, which `library_path` does.
     ///
     /// # Arguments
     ///
@@ -176,8 +178,9 @@ fn resolve_cargo(cargo: &Path, sysroot: &Path) -> Result<PathBuf> {
 /// `CARGO_TARGET_<TRIPLE>_RUNNER` (the triple upper-cased, with `-` and `.` as `_`). The direct
 /// runner cannot reproduce a runner, so the caller falls back to the via-cargo runner.
 ///
-/// Known limitation: a runner set in `.cargo/config.toml` (`target.<triple>.runner` or
-/// `target.'cfg(..)'.runner`) is not detected.
+/// Known limitations: a runner set in `.cargo/config.toml` (`target.<triple>.runner` or
+/// `target.'cfg(..)'.runner`) is not detected, and the triple is [`Toolchain::target`]'s, so
+/// with several `--target` flags only the last one's runner is checked.
 ///
 /// # Arguments
 ///
@@ -213,8 +216,6 @@ pub struct RunContext<'a> {
     pub build: &'a Build,
     /// The toolchain.
     pub toolchain: &'a Toolchain,
-    /// The user's cargo arguments, for the target triple (see [`Toolchain::target`]).
-    pub cargo_args: &'a CargoArgs,
     /// [`LIBRARY_PATH_VAR`] as this process got it; appended after the build's directories.
     pub inherited_library_path: Option<OsString>,
 }
@@ -251,8 +252,10 @@ impl RunOutcome {
 ///
 /// Name and value pairs, to set on top of this process's environment, in order (a later pair
 /// wins over an earlier one with the same name). The package's own build script's `OUT_DIR`
-/// and `rustc-env` variables come first, so Cargo's own variables win a clash, as in Cargo; a
-/// dependency's `rustc-env` variables are not set.
+/// and `rustc-env` variables come first, so Cargo's own variables win a clash, as in Cargo,
+/// with one exception: when the script sets [`LIBRARY_PATH_VAR`], its value replaces the whole
+/// library path, as it does under `cargo test`. A dependency's `rustc-env` variables are not
+/// set.
 ///
 /// # Errors
 ///
@@ -263,7 +266,8 @@ pub fn binary_env(
     context: &RunContext<'_>,
 ) -> Result<Vec<(OsString, OsString)>> {
     let mut vars: Vec<(OsString, OsString)> = Vec::new();
-    if let Some(script) = context.build.build_scripts.get(&binary.id.package_id) {
+    let own_script = context.build.build_scripts.get(&binary.id.package_id);
+    if let Some(script) = own_script {
         vars.push(("OUT_DIR".into(), script.out_dir.clone().into()));
         vars.extend(
             script
@@ -289,7 +293,12 @@ pub fn binary_env(
                 .map(|(name, path)| (format!("CARGO_BIN_EXE_{name}").into(), path.into())),
         );
     }
-    vars.push((LIBRARY_PATH_VAR.into(), library_path(binary, context)?));
+    // `is_some_and` is `own_script is not None and <test>(own_script)`.
+    let script_sets_library_path = own_script
+        .is_some_and(|script| script.env.iter().any(|(name, _)| name == LIBRARY_PATH_VAR));
+    if !script_sets_library_path {
+        vars.push((LIBRARY_PATH_VAR.into(), library_path(binary, context)?));
+    }
     Ok(vars)
 }
 
@@ -319,12 +328,37 @@ fn library_path(binary: &TestBinary, context: &RunContext<'_>) -> Result<OsStrin
     dirs.extend(artifact_dir);
     dirs.extend(binary.executable.parent().map(Path::to_path_buf));
     let toolchain = context.toolchain;
-    dirs.push(toolchain.target_libdir(toolchain.target(context.cargo_args)));
+    let triple = compiled_triple(
+        context.workspace.build_dir(),
+        &binary.executable,
+        &toolchain.host,
+    );
+    dirs.push(toolchain.target_libdir(triple));
     match &context.inherited_library_path {
         Some(inherited) => dirs.extend(env::split_paths(inherited)),
         None => dirs.extend(default_library_path()),
     }
     Ok(env::join_paths(dirs)?)
+}
+
+/// The triple a test executable was compiled for, read from where Cargo put it:
+/// `<build-dir>/<triple>/<profile>/deps/<name>` under `--target`, else
+/// `<build-dir>/<profile>/deps/<name>` for the host. This holds with several `--target` flags,
+/// where the arguments alone cannot say which binary is which.
+fn compiled_triple<'a>(build_dir: &Path, executable: &'a Path, host: &'a str) -> &'a str {
+    let Some(relative) = executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|profile_dir| profile_dir.strip_prefix(build_dir).ok())
+    else {
+        return host;
+    };
+    let mut components = relative.components();
+    match (components.next(), components.next(), components.next()) {
+        // Exactly two components: `<triple>/<profile>`. `to_str` is `None` for non-UTF-8.
+        (Some(Component::Normal(triple)), Some(_), None) => triple.to_str().unwrap_or(host),
+        _ => host,
+    }
 }
 
 /// What Cargo appends when the library path variable was unset: on macOS, the loader's own
@@ -556,40 +590,13 @@ mod tests {
             .collect()
     }
 
-    /// How the binary is compiled: for the host, for a plain `--target` triple, or for a
-    /// `.json` target specification (which counts as the host).
+    /// How `--target` is given: not at all, as a plain triple, or as a `.json` target
+    /// specification (which counts as the host).
     #[derive(Debug, Clone, Copy)]
     enum Compile {
         Host,
         Triple,
         Spec,
-    }
-
-    impl Compile {
-        fn cargo_args(self) -> CargoArgs {
-            let target: &[&str] = match self {
-                Compile::Host => &[],
-                Compile::Triple => &["--target", "tt"],
-                Compile::Spec => &["--target=specs/tt.json"],
-            };
-            CargoArgs::new(target.iter().map(OsString::from).collect())
-        }
-
-        /// The `<triple>` directory Cargo puts the binary under.
-        fn triple_dir(self) -> Option<&'static str> {
-            match self {
-                Compile::Host => None,
-                Compile::Triple | Compile::Spec => Some("tt"),
-            }
-        }
-
-        /// The triple whose standard library the binary loads, as this module decides it.
-        fn libdir_triple(self) -> &'static str {
-            match self {
-                Compile::Host | Compile::Spec => "h",
-                Compile::Triple => "tt",
-            }
-        }
     }
 
     const COMPILES: [Compile; 3] = [Compile::Host, Compile::Triple, Compile::Spec];
@@ -612,16 +619,21 @@ mod tests {
 
     // Property: CARGO_BIN_EXE_* is set exactly for integration tests and benchmarks; the
     // package's variables and CARGO are always set; OUT_DIR and the rustc-env variables are
-    // the package's own build script's, never a dependency's; the library path is the linked
-    // paths inside the binary's artifact directory (sorted, deduplicated), the artifact
-    // directory, the deps directory, the target's standard libraries, then what the variable
-    // held before.
+    // the package's own build script's, never a dependency's; the library path is the own
+    // script's value when it sets one, else the linked paths inside the binary's artifact
+    // directory (sorted, deduplicated), the artifact directory, the deps directory, the
+    // standard libraries of the triple the binary was built for, then what the variable held
+    // before.
     #[hegel::test]
     fn the_environment_is_cargos(tc: TestCase) {
         let kind = tc.draw(gs::sampled_from(&KINDS).print_as_debug());
-        let compile = tc.draw(gs::sampled_from(&COMPILES).print_as_debug());
+        // The `<triple>` directory Cargo builds the binary under: none for the host. Binaries for
+        // different triples can come from one build with several `--target` flags.
+        let triple_dir =
+            tc.draw(gs::sampled_from(&[None, Some("tt"), Some("uu")]).print_as_debug());
         let inherited = tc.draw(gs::booleans());
-        let artifact_dir = match compile.triple_dir() {
+        let script_sets_library_path = tc.draw(gs::booleans());
+        let artifact_dir = match triple_dir {
             None => PathBuf::from("/ws/target/debug"),
             Some(triple) => Path::new("/ws/target").join(triple).join("debug"),
         };
@@ -642,25 +654,29 @@ mod tests {
             .iter()
             .map(|(place, name)| place_path(*place, name))
             .collect();
-        let own_script = tc.draw(gs::booleans()).then(|| BuildScriptOutput {
-            out_dir: PathBuf::from("/cache/build/debug/build/a-1/out"),
-            env: vec![("OWN_ENV".to_owned(), "yes".to_owned())],
+        let own_script = tc.draw(gs::booleans()).then(|| {
+            let mut env = vec![("OWN_ENV".to_owned(), "yes".to_owned())];
+            if script_sets_library_path {
+                env.push((LIBRARY_PATH_VAR.to_owned(), "/script/lib".to_owned()));
+            }
+            BuildScriptOutput {
+                out_dir: PathBuf::from("/cache/build/debug/build/a-1/out"),
+                env,
+            }
         });
         let (workspace, toolchain) = (workspace(), toolchain());
         let build = build(linked_paths, own_script.clone());
-        let cargo_args = compile.cargo_args();
         let context = RunContext {
             workspace: &workspace,
             build: &build,
             toolchain: &toolchain,
-            cargo_args: &cargo_args,
             inherited_library_path: inherited
                 .then(|| env::join_paths(["/x", "/y"]).expect("joinable")),
         };
         let package = workspace.package(ID).expect("listed");
 
-        let vars = binary_env(&binary(kind, compile.triple_dir()), package, &context)
-            .expect("an environment");
+        let vars =
+            binary_env(&binary(kind, triple_dir), package, &context).expect("an environment");
 
         assert_eq!(
             get(&vars, "CARGO_BIN_EXE_tool").is_some(),
@@ -677,8 +693,13 @@ mod tests {
             own_script.as_ref().map(|_| OsStr::new("yes"))
         );
         assert_eq!(get(&vars, "DEP_ENV"), None);
-        let library_path: Vec<PathBuf> =
-            env::split_paths(get(&vars, LIBRARY_PATH_VAR).expect("set")).collect();
+        let library_path = get(&vars, LIBRARY_PATH_VAR).expect("set");
+        if own_script.is_some() && script_sets_library_path {
+            // The package's own script replaces the whole library path, as under Cargo.
+            assert_eq!(library_path, OsStr::new("/script/lib"));
+            return;
+        }
+        let library_path: Vec<PathBuf> = env::split_paths(library_path).collect();
         let mut expected: Vec<PathBuf> = drawn
             .iter()
             .filter(|(place, _)| *place == Place::ArtifactDir)
@@ -688,7 +709,7 @@ mod tests {
             .collect();
         expected.push(artifact_dir.clone());
         expected.push(
-            binary(kind, compile.triple_dir())
+            binary(kind, triple_dir)
                 .executable
                 .parent()
                 .expect("in a directory")
@@ -696,7 +717,7 @@ mod tests {
         );
         expected.push(
             Path::new("/sys/lib/rustlib")
-                .join(compile.libdir_triple())
+                .join(triple_dir.unwrap_or("h"))
                 .join("lib"),
         );
         if inherited {
@@ -714,12 +735,10 @@ mod tests {
         let name = tc.draw(gs::text().alphabet("ab").min_size(1).max_size(2));
         let (workspace, toolchain) = (workspace(), toolchain());
         let build = build(vec![Path::new("/ws/target/debug/build").join(&name)], None);
-        let cargo_args = CargoArgs::default();
         let context = RunContext {
             workspace: &workspace,
             build: &build,
             toolchain: &toolchain,
-            cargo_args: &cargo_args,
             inherited_library_path: Some(OsString::new()),
         };
         let mut outside = binary(TargetKind::Lib, None);
@@ -751,12 +770,10 @@ mod tests {
         let test_args = draw_test_args(&tc);
         let (workspace, toolchain) = (workspace(), toolchain());
         let build = build(Vec::new(), own_script);
-        let cargo_args = CargoArgs::default();
         let context = RunContext {
             workspace: &workspace,
             build: &build,
             toolchain: &toolchain,
-            cargo_args: &cargo_args,
             inherited_library_path: None,
         };
         let binary = binary(kind, None);

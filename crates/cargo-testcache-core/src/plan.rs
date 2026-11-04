@@ -158,6 +158,8 @@ pub fn decide(
         Ok(parts) => parts,
         Err(why) => return Decision::Run(RunReason::Unavailable(why.clone())),
     };
+    // `let ... else` is a pattern match that must succeed; the `else` block must leave the
+    // function (here by returning), like an early `if x is None: return` in Python.
     let Some(previous) = previous else {
         return Decision::Run(RunReason::NeverPassed);
     };
@@ -208,6 +210,8 @@ fn changed_names<'a, V: PartialEq>(
     old: &'a BTreeMap<String, V>,
     new: &'a BTreeMap<String, V>,
 ) -> impl Iterator<Item = String> + 'a {
+    // `impl Iterator + 'a` returns some lazy iterator (like a Python generator) that borrows
+    // from `old` and `new`; `'a` says it may not outlive them.
     let removed_or_changed = old
         .iter()
         .filter(|(name, value)| new.get(*name) != Some(*value))
@@ -236,6 +240,8 @@ pub fn pass_record(
     duration: Duration,
     passed_at: u64,
 ) -> Option<PassRecord> {
+    // `bool::then` runs the closure only when `passed` is true and gives `Some(result)`, else
+    // `None`: Python's `Record(...) if passed else None`.
     passed.then(|| PassRecord {
         target: target.clone(),
         key: parts.key(),
@@ -255,6 +261,7 @@ mod tests {
     use hegel::generators as gs;
 
     use crate::discover::TargetKind;
+    use crate::key::Digest;
     use crate::key::testing::{draw_parts, mutate_one_part};
 
     fn target() -> TargetId {
@@ -270,8 +277,20 @@ mod tests {
             .expect("a pass is recorded")
     }
 
+    /// The one change `mutate_one_part` makes for `which` (0 to 5), named `name`.
+    fn expected_change(which: u8, name: &str) -> Change {
+        match which {
+            0 => Change::Tool,
+            1 => Change::Binary,
+            2 => Change::Spawned(name.to_owned()),
+            3 => Change::Input(name.to_owned()),
+            4 => Change::Env(name.to_owned()),
+            _ => Change::Args,
+        }
+    }
+
     // Property (design 9): with no policy in the way, a binary is skipped exactly when its
-    // current parts are the ones recorded, and a run says why.
+    // current parts are the ones recorded, and a run says which single part changed.
     #[hegel::test]
     fn skipped_exactly_when_the_key_is_recorded(tc: TestCase) {
         let parts = draw_parts(&tc);
@@ -283,7 +302,7 @@ mod tests {
             1 => Some(record_of(parts.clone())),
             _ => {
                 let mut changed = parts.clone();
-                mutate_one_part(&mut changed, which, name);
+                mutate_one_part(&mut changed, which, name.clone());
                 Some(record_of(changed))
             }
         };
@@ -293,16 +312,30 @@ mod tests {
         match (history, decision) {
             (0, Decision::Run(RunReason::NeverPassed)) => {}
             (1, Decision::Skip { passed_at }) => assert_eq!(passed_at, 7),
-            (2, Decision::Run(RunReason::Changed(changes))) => assert_eq!(changes.len(), 1),
+            (2, Decision::Run(RunReason::Changed(changes))) => {
+                assert_eq!(changes, [expected_change(which, &name)]);
+            }
             (history, decision) => panic!("history {history} gave {decision:?}"),
         }
     }
 
-    // Property: --no-cache, always_run and an uncomputable key each force a run.
+    // Property: --no-cache, always_run and an uncomputable key each force a run, in that order,
+    // then a missing record, then the key comparison.
     #[hegel::test]
     fn policies_and_unknown_keys_force_a_run(tc: TestCase) {
         let parts = draw_parts(&tc);
-        let previous = record_of(parts.clone());
+        let history = tc.draw(gs::integers::<u8>().max_value(2));
+        let which = tc.draw(gs::integers::<u8>().max_value(5));
+        let name = tc.draw(gs::text().max_size(6));
+        let previous = match history {
+            0 => None,
+            1 => Some(record_of(parts.clone())),
+            _ => {
+                let mut changed = parts.clone();
+                mutate_one_part(&mut changed, which, name.clone());
+                Some(record_of(changed))
+            }
+        };
         let no_cache = tc.draw(gs::booleans());
         let always_run = tc.draw(gs::booleans());
         let known = tc.draw(gs::booleans());
@@ -314,7 +347,7 @@ mod tests {
 
         let decision = decide(
             &parts,
-            Some(&previous),
+            previous.as_ref(),
             Policy {
                 no_cache,
                 always_run,
@@ -322,36 +355,75 @@ mod tests {
         );
 
         let expected = if no_cache {
-            Some(RunReason::NoCache)
+            Decision::Run(RunReason::NoCache)
         } else if always_run {
-            Some(RunReason::AlwaysRun)
+            Decision::Run(RunReason::AlwaysRun)
         } else if !known {
-            Some(RunReason::Unavailable("unreadable".to_owned()))
+            Decision::Run(RunReason::Unavailable("unreadable".to_owned()))
         } else {
-            None
+            match history {
+                0 => Decision::Run(RunReason::NeverPassed),
+                1 => Decision::Skip { passed_at: 7 },
+                _ => Decision::Run(RunReason::Changed(vec![expected_change(which, &name)])),
+            }
         };
-        match expected {
-            Some(reason) => assert_eq!(decision, Decision::Run(reason)),
-            None => assert!(matches!(decision, Decision::Skip { .. })),
-        }
+        assert_eq!(decision, expected);
     }
 
-    // Property: changes() names the one input that changed, and nothing else.
+    // Property: a record whose stored key disagrees with its parts is corrupt; it must run
+    // (blaming the tool, since the parts match) and never skip.
     #[hegel::test]
-    fn changes_name_the_changed_input(tc: TestCase) {
+    fn a_corrupt_record_runs_never_skips(tc: TestCase) {
+        let parts = draw_parts(&tc);
+        let mut record = record_of(parts.clone());
+        let corrupt = Digest::of_bytes(b"corrupt");
+        tc.assume(corrupt != record.key);
+        record.key = corrupt;
+
+        let decision = decide(&Ok(parts), Some(&record), Policy::default());
+
+        assert_eq!(
+            decision,
+            Decision::Run(RunReason::Changed(vec![Change::Tool]))
+        );
+    }
+
+    // Property: changes() names the one part that changed, and nothing else.
+    #[hegel::test]
+    fn changes_name_the_changed_part(tc: TestCase) {
         let old = draw_parts(&tc);
+        let which = tc.draw(gs::integers::<u8>().max_value(5));
         let name = tc.draw(gs::text().max_size(6));
         let mut new = old.clone();
-        mutate_one_part(&mut new, 3, name.clone());
+        mutate_one_part(&mut new, which, name.clone());
 
-        assert_eq!(changes(&old, &new), [Change::Input(name.clone())]);
+        assert_eq!(changes(&old, &new), [expected_change(which, &name)]);
         assert_eq!(
             Change::Input(name.clone()).to_string(),
             format!("input {name} changed")
         );
     }
 
+    // Property: removing one input is reported as that input changing, and nothing else.
+    #[hegel::test]
+    fn a_removed_input_is_a_change(tc: TestCase) {
+        let old = draw_parts(&tc);
+        tc.assume(!old.inputs.is_empty());
+        let index = tc.draw(gs::integers::<usize>().max_value(old.inputs.len() - 1));
+        let removed = old
+            .inputs
+            .keys()
+            .nth(index)
+            .expect("index is in range")
+            .clone();
+        let mut new = old.clone();
+        new.inputs.remove(&removed);
+
+        assert_eq!(changes(&old, &new), [Change::Input(removed)]);
+    }
+
     // Property (design 9): only a passing run produces a record, and its key is its parts' key.
+    // The duration saturates at u64::MAX instead of wrapping.
     #[hegel::test]
     fn only_a_pass_is_recorded(tc: TestCase) {
         let parts = draw_parts(&tc);
@@ -371,5 +443,16 @@ mod tests {
             assert_eq!(record.key, parts.key());
             assert_eq!(record.duration_ms, millis);
         }
+    }
+
+    // Property: a duration too long for u64 milliseconds is recorded as u64::MAX.
+    #[hegel::test]
+    fn an_enormous_duration_saturates(tc: TestCase) {
+        let parts = draw_parts(&tc);
+
+        let record =
+            pass_record(&target(), parts, true, Duration::MAX, 1).expect("a pass is recorded");
+
+        assert_eq!(record.duration_ms, u64::MAX);
     }
 }

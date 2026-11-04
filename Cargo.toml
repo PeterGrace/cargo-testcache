@@ -1,0 +1,83 @@
+# Virtual workspace manifest: this file declares no package of its own. It lists the member
+# crates and holds the settings they share. Members opt in with `<key>.workspace = true`, much
+# like inheriting from a shared base config.
+#
+# Layout: `crates/cargo-testcache` is a thin binary (CLI parsing, logging, signals);
+# `crates/cargo-testcache-core` is the library that holds the application's logic, so its
+# tests (and other crates) can call it directly. Add crates under `crates/`.
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Minimum supported Rust version, checked by `just msrv`. Edition 2024 needs 1.85; `if let`
+# chains (used in main.rs) need 1.88.
+rust-version = "1.88"
+authors = ["Peter Grace <pete.grace@gmail.com>"]
+publish = false
+
+[workspace.dependencies]
+# Internal crates, referenced by path so members can depend on each other.
+cargo-testcache-core = { path = "crates/cargo-testcache-core" }
+
+# Application-level errors with `.context()`, used by the binary.
+anyhow = "1.0.104"
+# Command-line parsing. `derive` gives `#[derive(Parser)]`; `env` lets an `#[arg]` fall back to
+# an environment variable.
+clap = { version = "4.6.7", features = ["derive", "env"] }
+# tokio-console support, only behind the binary's `tokio-console` feature.
+console-subscriber = "0.5.0"
+# Loads `.env` into the environment at startup. `dotenvy` is the maintained fork of `dotenv`.
+dotenvy = "0.15.7"
+# Wrapper types that keep secrets out of `Debug` output and logs. Not used by the skeleton;
+# here so every crate that needs it shares one version.
+secrecy = "0.10.3"
+# Serialization, likewise shared but not used by the skeleton.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Library error enums (`#[derive(Error)]`).
+thiserror = "2.0.21"
+# Async runtime. Features are declared rather than left to feature unification: `rt-multi-thread`
+# and `macros` for `#[tokio::main]`, `signal` for SIGTERM/SIGINT, `sync` for the shutdown
+# channel, `time` for the bounded drain.
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tracing = "0.1.44"
+# `json` adds the JSON log format; `env-filter` reads `RUST_LOG`.
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
+
+# Hegel property-based testing. Published as `hegeltest`, imported as `hegel`. `static-engine`
+# links the engine into the test binary instead of downloading it at test time.
+hegeltest = { version = "0.52.0", features = ["static-engine"] }
+
+# Raising real signals in the shutdown tests.
+nix = { version = "0.31.3", features = ["signal"] }
+
+[workspace.lints.rust]
+# Every public item needs a doc comment; `-D warnings` in CI turns this into an error.
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+# `cfg(dylint_lib = "...")` is set only while dylint runs, for `#[cfg_attr(dylint_lib = ...,
+# allow(...))]` exemptions; this stops ordinary builds warning that the cfg is unknown.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dylint_lib, values(any()))"] }
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+# Slower release builds for a smaller, faster binary.
+lto = true
+codegen-units = 1
+
+# Lint libraries `just dylint` runs. Bump a tag here and the matching `cargo-dylint` version
+# together: a library is compiled against a driver, and a mismatched pair fails to load.
+[workspace.metadata.dylint]
+libraries = [
+    { git = "https://github.com/trailofbits/dylint", tag = "v6.0.4", pattern = "examples/supplementary" },
+    { git = "https://github.com/hypotheosis/hyp-rust-policy-lints", tag = "v0.1.2", pattern = "lints/*" },
+]
+

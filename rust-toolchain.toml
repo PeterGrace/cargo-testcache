@@ -1,0 +1,10 @@
+# Pins the Rust toolchain for local builds, CI and the Dockerfile. rustup reads this file and
+# installs the version and components on first use, so everyone compiles with the same rustc,
+# rustfmt and clippy. Bump deliberately, in its own commit, together with the `rust` image tag
+# in the Dockerfile. The minimum supported version is separate: `rust-version` in Cargo.toml,
+# checked by `just msrv`.
+[toolchain]
+channel = "1.99.1"
+# `llvm-tools` is what `cargo llvm-cov` (`just coverage`) instruments with.
+components = ["rustfmt", "clippy", "llvm-tools"]
+profile = "minimal"

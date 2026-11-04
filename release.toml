@@ -1,0 +1,18 @@
+# cargo-release settings for the whole workspace. `just release-prepare <level>` runs
+# cargo-release with these; `just release-ship` lands the commit on main and pushes the tag.
+
+# Every crate shares `[workspace.package] version`: one bump, one commit, one tag.
+shared-version = true
+consolidate-commits = true
+allow-branch = ["main"]
+
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+pre-release-commit-message = "chore: Release v{{version}}"
+
+# Nothing goes to crates.io (`publish = false` in Cargo.toml), and `just release-ship` does
+# the pushing.
+publish = false
+push = false
+# The release commit only changes version strings; CI runs the full suite on it.
+verify = false

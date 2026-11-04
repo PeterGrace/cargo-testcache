@@ -1,0 +1,9 @@
+/target
+# Local secrets and settings; .env.example documents the variables.
+.env
+# Git worktrees for parallel agent sessions.
+.worktrees/
+# Hegel's failure database and run state.
+.hegel/
+# claims-mcp's lock while it writes claims.json.
+/.claims.json.lock

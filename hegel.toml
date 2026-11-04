@@ -1,0 +1,12 @@
+# Hegel property-test settings for the whole workspace.
+#
+# Fail a run when a test behaves differently on replay of the same input (hidden global state,
+# time, concurrency) instead of quietly tolerating it. The shipped `development` (local) and
+# `ci` profiles don't inherit from each other, so both need the setting. Hegel switches to the
+# derandomized `ci` profile on its own when `CI` or `GITHUB_ACTIONS` is set.
+
+[profiles.development]
+nondeterminism_strictness = "error"
+
+[profiles.ci]
+nondeterminism_strictness = "error"

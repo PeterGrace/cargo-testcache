@@ -1,0 +1,118 @@
+# Enforces the pre-commit checklist from .claude/CLAUDE.md on every pull request and push to
+# main. Each step calls a justfile recipe, so `just <recipe>` reproduces it locally. Warnings
+# fail through `-D warnings` (clippy) and RUSTFLAGS/RUSTDOCFLAGS, never `#![deny(warnings)]`.
+#
+# Actions are pinned by commit SHA with the version in a comment; Dependabot bumps both.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# Read-only token by default; a job that needs more asks for it.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its in-flight run. Runs on main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: fmt, clippy, doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installs the toolchain and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Fails if Cargo.lock is out of date, so no later step can change it.
+      - run: cargo fetch --locked
+      - run: just fmt-check
+      - run: just clippy
+      - run: just clippy-tokio-console
+      - run: just doc
+
+  # `cargo-dylint` and `dylint-link` must match the trailofbits tag in Cargo.toml's
+  # `[workspace.metadata.dylint]`; bump them together. The first run on a new tag builds the
+  # lint libraries on their nightly, which takes a few minutes; the cache keeps them after.
+  dylint:
+    name: dylint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just,cargo-dylint@6.0.4,dylint-link@6.0.4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.dylint_drivers
+            target/dylint
+          # Keyed on Cargo.toml, whose library tags select what gets built.
+          key: dylint-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: dylint-${{ runner.os }}-
+      - run: cargo fetch --locked
+      - run: just dylint
+
+  # A crate with a RustSec advisory, a license outside deny.toml's list, a wildcard version or
+  # a non-crates.io source fails. The advisory database is fetched each run, so a newly
+  # published advisory fails the next run on any branch.
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      # cargo-deny is pinned: a release that changes the config schema would fail every run.
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just,cargo-deny@0.20.2
+      - run: just deny
+
+  # The test suite under coverage instrumentation, then doctests (which llvm-cov skips on
+  # stable), then a coverage table on the run's summary page. Coverage is report-only.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just,cargo-llvm-cov
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - run: just coverage
+      - run: just coverage-markdown >> "$GITHUB_STEP_SUMMARY"
+      - run: cargo test --workspace --locked --doc
+      # Hegel uses its derandomized `ci` profile on its own when GITHUB_ACTIONS is set.
+      - run: just hegel-canary
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just
+      - run: just msrv
+

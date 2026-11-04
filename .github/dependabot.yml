@@ -1,0 +1,20 @@
+# Opens a pull request when a pin falls behind: crates in Cargo.toml and Cargo.lock, and the
+# actions in .github/workflows, pinned by commit with the version in a comment.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Minor and patch bumps in one pull request a week; each major bump gets its own.
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

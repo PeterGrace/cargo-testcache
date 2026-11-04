@@ -1,0 +1,61 @@
+# cargo-deny's configuration (https://embarkstudios.github.io/cargo-deny/). `just deny` runs
+# `cargo deny check advisories bans licenses sources` with it, and so does the `deny` CI job.
+# Each check fails the build on its own: a vulnerable, unmaintained, unsound, or yanked crate
+# (advisories), a wildcard version requirement (bans), a license outside the allow list
+# (licenses), or a crate from anywhere but crates.io (sources).
+#
+# An exception here needs a reason next to it.
+
+[graph]
+# No `targets` filter, so the crates of every platform count, not only the host's, and every
+# feature is on, so an optional dependency (`tokio-console`'s among them) is checked too.
+all-features = true
+
+[advisories]
+# The RustSec advisory database. Vulnerabilities always fail; `unmaintained = "all"` fails on
+# an unmaintained crate anywhere in the graph, direct or transitive, and `unsound` likewise.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+# A red `deny` run on an unchanged tree is usually a newly published advisory. Update the crate
+# if a fixed version exists; otherwise add `{ id = "RUSTSEC-YYYY-NNNN", reason = "..." }` here.
+ignore = []
+
+[bans]
+# Two versions of one crate are common in an async graph (a dependency lagging a major
+# version), and nothing here can fix them, so they warn rather than fail.
+multiple-versions = "warn"
+# A `*` version requirement would let `cargo update` pull anything.
+wildcards = "deny"
+# The workspace's own path dependencies carry no version, which
+# cargo-deny would otherwise count as wildcards. They are never published (`publish = false`).
+allow-wildcard-paths = true
+
+[licenses]
+# Permissive licenses only, so the image can ship without a copyleft obligation. An `OR`
+# expression passes when one of its alternatives is here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# A license above that no crate uses any longer fails nothing.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace crates have no `license` field: they are `publish = false`.
+ignore = true
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

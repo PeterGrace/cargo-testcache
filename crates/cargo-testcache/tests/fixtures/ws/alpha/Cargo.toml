@@ -1,0 +1,16 @@
+[package]
+name = "alpha"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.89"
+authors = ["Example Author <author@example.com>", "Second Author"]
+description = "Fixture library."
+license-file = "LICENSE.txt"
+build = "build.rs"
+publish = false
+
+[dev-dependencies]
+probe = { path = "../probe" }
+
+[package.metadata.testcache]
+inputs = ["fixtures/**"]

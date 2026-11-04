@@ -1,0 +1,10 @@
+# A small workspace the integration tests copy to a temporary directory and run
+# `cargo testcache` against. Its own `[workspace]` table makes it a separate root, not a member
+# of the cargo-testcache workspace.
+[workspace]
+members = ["probe", "alpha", "beta", "gamma"]
+resolver = "3"
+
+[workspace.metadata.testcache]
+inputs = ["data/**"]
+env = ["FIXTURE_ENV"]

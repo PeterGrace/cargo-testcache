@@ -19,7 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::args::CargoArgs;
-use crate::key::Digest;
+use crate::key::{Digest, PartResult};
 
 /// The `--config` option of Cargo.
 const CONFIG_FLAG: &str = "--config";
@@ -31,7 +31,7 @@ const ENV_TABLE: &str = "env";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoConfig {
     /// The digest of every file and `--config` value, or why one could not be read.
-    digest: std::result::Result<Digest, String>,
+    digest: PartResult<Digest>,
     /// Whether any of them has (or may have) an `[env]` table.
     sets_env: bool,
 }
@@ -104,7 +104,7 @@ impl CargoConfig {
     /// # Returns
     ///
     /// Its digest, or why a file could not be read.
-    pub fn digest(&self) -> std::result::Result<Digest, String> {
+    pub fn digest(&self) -> PartResult<Digest> {
         self.digest.clone()
     }
 

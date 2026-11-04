@@ -30,6 +30,12 @@ pub const ALWAYS_KEYED_ENV: [&str; 2] = ["RUST_TEST_THREADS", "RUST_MIN_STACK"];
 /// its siblings, which turn libtest's time limits on).
 pub const ALWAYS_KEYED_ENV_PREFIX: &str = "RUST_TEST_TIME_";
 
+/// A key part, or why it cannot be computed (an unreadable file, an executable outside the
+/// build directory). The error is a message for the run reason rather than an
+/// [`Error`](crate::Error): a part that cannot be computed makes its binary run, it does not
+/// fail the run.
+pub type PartResult<T> = std::result::Result<T, String>;
+
 /// How much of a file is read per hash update. Test binaries run to hundreds of megabytes.
 const READ_CHUNK: usize = 256 * 1024;
 
@@ -111,15 +117,6 @@ impl Digest {
             }
         }
         Ok(Self(hasher.finalize().into()))
-    }
-
-    /// The digest's raw bytes.
-    ///
-    /// # Returns
-    ///
-    /// The 32 bytes of the SHA-256 digest.
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
     }
 }
 

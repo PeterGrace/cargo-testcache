@@ -14,7 +14,7 @@ use crate::discover::{self, Build, TargetKind, TestBinary};
 use crate::error::{Error, Result};
 use crate::exec::{self, LIBRARY_PATH_VAR, RunContext, Toolchain};
 use crate::inputs::InputIndex;
-use crate::key::{self, Digest, KeyParts};
+use crate::key::{self, Digest, KeyParts, PartResult};
 use crate::plan::{self, Decision, Policy};
 use crate::report::{self, Progress, Tally};
 use crate::store::Store;
@@ -30,10 +30,6 @@ const DIFFERENT_BINARY: &str = "Cargo builds a different binary for this target 
 /// Why a pass is not recorded when a binary changed while it ran.
 const CHANGED_DURING_RUN: &str =
     "the binary changed during the run (another build relinked it); the pass is not recorded";
-
-/// A file's digest, or why it could not be read. Spelled out because the crate's `Result`
-/// alias fixes the error type to [`Error`], and these errors are messages for a run reason.
-type FileDigest = std::result::Result<Digest, String>;
 
 /// How `cargo testcache` was asked to run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -159,7 +155,7 @@ pub fn clear(cargo_args: &CargoArgs) -> Result<bool> {
 struct Planned<'a> {
     binary: &'a TestBinary,
     label: String,
-    parts: std::result::Result<KeyParts, String>,
+    parts: PartResult<KeyParts>,
     /// The binaries it may spawn, by their name in the key: hashed again before a pass is
     /// recorded. Empty when they could not be known, and then `parts` is an error.
     spawned: Vec<(String, PathBuf)>,
@@ -180,11 +176,11 @@ struct Session<'a> {
 struct KeyContext<'a> {
     workspace: &'a Workspace,
     inputs: &'a InputIndex,
-    digests: &'a HashMap<PathBuf, FileDigest>,
+    digests: &'a HashMap<PathBuf, PartResult<Digest>>,
     environment: &'a BTreeMap<OsString, OsString>,
     tool: String,
     args: Digest,
-    cargo_config: std::result::Result<Digest, String>,
+    cargo_config: PartResult<Digest>,
 }
 
 // `Session<'_>`: the impl works for a `Session` borrowing for any lifetime; `'_` lets the
@@ -226,7 +222,13 @@ impl Session<'_> {
             .into_iter()
             .zip(spawned)
             .map(|((binary, package), spawned)| {
-                let parts = key_parts(binary, package, spawned.as_deref(), &context);
+                // `as_deref` borrows the paths; the error, only when there is one, is copied.
+                let parts = key_parts(
+                    binary,
+                    package,
+                    spawned.as_deref().map_err(String::clone),
+                    &context,
+                );
                 let policy = Policy {
                     no_cache: self.options.no_cache,
                     always_run: always_run.matches(package.name(), &binary.id.name),
@@ -587,7 +589,7 @@ fn spawned_paths(
     build: &Build,
     binary: &TestBinary,
     package: &Package,
-) -> std::result::Result<Vec<(String, PathBuf)>, String> {
+) -> PartResult<Vec<(String, PathBuf)>> {
     let mut paths = Vec::new();
     if binary.id.kind.spawns_package_bins()
         && let Some(bins) = build.package_bins.get(&binary.id.package_id)
@@ -613,7 +615,9 @@ fn spawned_paths(
 }
 
 /// Hashes every distinct file once, in parallel, with a progress bar.
-fn hash_files<'a>(paths: impl IntoIterator<Item = &'a Path>) -> HashMap<PathBuf, FileDigest> {
+fn hash_files<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> HashMap<PathBuf, PartResult<Digest>> {
     let unique: HashSet<&Path> = paths.into_iter().collect();
     let progress = Progress::new(unique.len(), "hashing test binaries");
     // `into_par_iter` (rayon) spreads the work over a thread pool, like a
@@ -635,9 +639,9 @@ fn hash_files<'a>(paths: impl IntoIterator<Item = &'a Path>) -> HashMap<PathBuf,
 fn key_parts(
     binary: &TestBinary,
     package: &Package,
-    spawned: std::result::Result<&[(String, PathBuf)], &String>,
+    spawned: PartResult<&[(String, PathBuf)]>,
     context: &KeyContext<'_>,
-) -> std::result::Result<KeyParts, String> {
+) -> PartResult<KeyParts> {
     let digest = |path: &Path| {
         context
             .digests
@@ -649,11 +653,10 @@ fn key_parts(
         tool: context.tool.clone(),
         binary: digest(&binary.executable)?,
         // Collecting an iterator of `Result`s into one `Result` stops at the first error.
-        spawned: spawned
-            .map_err(String::clone)?
+        spawned: spawned?
             .iter()
             .map(|(name, path)| Ok((name.clone(), digest(path)?)))
-            .collect::<std::result::Result<_, String>>()?,
+            .collect::<PartResult<_>>()?,
         inputs: context.inputs.for_package(&binary.id.package_id)?,
         env: key::env_part(context.workspace.env_names(package), context.environment),
         args: context.args,

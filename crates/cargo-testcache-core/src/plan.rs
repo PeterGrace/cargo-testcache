@@ -5,7 +5,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::discover::TargetId;
-use crate::key::KeyParts;
+use crate::key::{KeyParts, PartResult};
 use crate::store::PassRecord;
 
 /// What forces a binary to run whatever its key.
@@ -80,6 +80,10 @@ pub enum ReasonCategory {
 
 impl ReasonCategory {
     /// The group's name in the summary line.
+    ///
+    /// # Returns
+    ///
+    /// Such as `changed` or `never passed`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Changed => "changed",
@@ -93,6 +97,10 @@ impl ReasonCategory {
 
 impl RunReason {
     /// The reason's group in the summary line.
+    ///
+    /// # Returns
+    ///
+    /// The [`ReasonCategory`] of this variant.
     pub fn category(&self) -> ReasonCategory {
         match self {
             Self::NoCache => ReasonCategory::NoCache,
@@ -147,7 +155,7 @@ impl fmt::Display for RunReason {
 /// reason that applies, in the order `--no-cache`, `always_run`, unavailable, never passed,
 /// changed.
 pub fn decide(
-    parts: &std::result::Result<KeyParts, String>,
+    parts: &PartResult<KeyParts>,
     previous: Option<&PassRecord>,
     policy: Policy,
 ) -> Decision {

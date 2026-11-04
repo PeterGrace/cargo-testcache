@@ -307,7 +307,7 @@ impl CargoArgs {
     ///
     /// The values; an occurrence without a value is left out.
     pub fn values<'a>(&'a self, flag: &str) -> impl Iterator<Item = &'a OsStr> {
-        // `flatten` over `Option`s keeps the `Some` values, like `[v for v in xs if v is not None]`.
+        // `flatten` over `Option`s keeps the `Some` values: `[v for v in xs if v is not None]`.
         self.occurrences(flag).flatten()
     }
 

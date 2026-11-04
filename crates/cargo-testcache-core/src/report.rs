@@ -118,6 +118,10 @@ impl Tally {
     }
 
     /// Whether anything failed.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a binary, a whole-workspace `cargo test` or the doc tests failed.
     pub fn any_failed(&self) -> bool {
         self.failed > 0 || self.whole_run_failed || self.doc_tests_failed
     }

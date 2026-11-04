@@ -20,7 +20,7 @@ A test filter spelled exactly `status` or `clear` must be written after `--`
 | Option | Effect |
 |---|---|
 | `--no-cache` | Run everything and record the passes |
-| `--explain` | Print why each binary runs (binary changed, input `x` changed, env `Y` changed, ...) |
+| `--explain` | Print why each binary runs: binary, input `x` or env `Y` changed, ... |
 | `--via-cargo` | Run each binary through `cargo test -p <pkg> --test <name>` instead of directly |
 | `--no-doc` | Skip doc tests (they are never cached) |
 

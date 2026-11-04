@@ -84,21 +84,37 @@ impl Package {
     }
 
     /// The package name.
+    ///
+    /// # Returns
+    ///
+    /// The name from its `Cargo.toml`.
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// The directory holding its `Cargo.toml`: test binaries' working directory.
+    ///
+    /// # Returns
+    ///
+    /// The absolute directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// The `CARGO_MANIFEST_*` and `CARGO_PKG_*` variables `cargo test` sets for its binaries.
+    ///
+    /// # Returns
+    ///
+    /// Name and value pairs, in a fixed order.
     pub fn env(&self) -> &[(&'static str, OsString)] {
         &self.env
     }
 
     /// Its `[package.metadata.testcache]` table.
+    ///
+    /// # Returns
+    ///
+    /// The table; the default for a package that is not a workspace member.
     pub fn config(&self) -> &TestcacheConfig {
         &self.config
     }
@@ -210,16 +226,28 @@ impl Workspace {
     }
 
     /// The workspace root.
+    ///
+    /// # Returns
+    ///
+    /// The directory `cargo metadata` reports as `workspace_root`.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// The target directory (`bin` executables, and the cache).
+    ///
+    /// # Returns
+    ///
+    /// The directory `cargo metadata` reports as `target_directory`.
     pub fn target_dir(&self) -> &Path {
         &self.target_dir
     }
 
     /// The build directory (test executables); the target directory unless configured apart.
+    ///
+    /// # Returns
+    ///
+    /// `cargo metadata`'s `build_directory`, or the target directory before Cargo 1.91.
     pub fn build_dir(&self) -> &Path {
         &self.build_dir
     }
@@ -230,6 +258,10 @@ impl Workspace {
     }
 
     /// The `[workspace.metadata.testcache]` table.
+    ///
+    /// # Returns
+    ///
+    /// The table, or the default when there is none.
     pub fn config(&self) -> &TestcacheConfig {
         &self.config
     }
@@ -297,6 +329,10 @@ impl Workspace {
     /// A package's patterns are not scoped to that package: they join one workspace-wide set
     /// and match `package/target` for every package. This differs from `inputs`, whose globs
     /// are relative to the package that declares them.
+    ///
+    /// # Returns
+    ///
+    /// The compiled patterns.
     ///
     /// # Errors
     ///

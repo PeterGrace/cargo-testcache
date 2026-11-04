@@ -23,7 +23,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
-use crate::key::Digest;
+use crate::key::{Digest, PartResult};
 use crate::manifest::glob;
 use crate::workspace::Workspace;
 
@@ -311,7 +311,7 @@ struct InputFile {
     relative: String,
     owners: Vec<Owner>,
     /// Its digest, or why it could not be read.
-    digest: std::result::Result<Digest, String>,
+    digest: PartResult<Digest>,
 }
 
 /// Every matched input file, hashed.
@@ -373,10 +373,7 @@ impl InputIndex {
     ///
     /// Workspace-relative path to digest, or why the inputs cannot be known (an unreadable
     /// file, or a package outside the workspace root that declares inputs).
-    pub fn for_package(
-        &self,
-        package_id: &str,
-    ) -> std::result::Result<BTreeMap<String, Digest>, String> {
+    pub fn for_package(&self, package_id: &str) -> PartResult<BTreeMap<String, Digest>> {
         if self.patterns.outside.contains(package_id) {
             return Err("the package declares inputs but is outside the workspace root".to_owned());
         }
@@ -646,7 +643,7 @@ mod tests {
         let patterns = patterns("crates/a");
         let (shared, own_a, own_b) = (draw_digest(&tc), draw_digest(&tc), draw_digest(&tc));
         let a_readable = tc.draw(gs::booleans());
-        let file = |relative: &str, digest: std::result::Result<Digest, String>| InputFile {
+        let file = |relative: &str, digest: PartResult<Digest>| InputFile {
             owners: patterns.owners_of(relative),
             relative: relative.to_owned(),
             digest,

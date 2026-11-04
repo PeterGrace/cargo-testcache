@@ -53,6 +53,10 @@ impl TargetKind {
     }
 
     /// The kind's name, as Cargo's messages spell it.
+    ///
+    /// # Returns
+    ///
+    /// `lib`, `bin`, `test`, `bench` or `example`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Lib => "lib",

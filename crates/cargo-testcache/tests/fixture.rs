@@ -194,25 +194,43 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Both variants of a property, in the drawn order: as given, or `reversed`.
+fn in_order<T>(mut variants: [T; 2], reversed: bool) -> [T; 2] {
+    if reversed {
+        variants.reverse();
+    }
+    variants
+}
+
 /// A set of owned binary names.
 fn names(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
 
 // Property (9.1): the first run runs every binary and the second skips every one, with either
-// runner.
+// runner. Both runners are checked in every case, each on a fresh fixture, in a drawn order.
 #[hegel::test(test_cases = 2)]
 fn the_second_run_skips_every_binary(tc: TestCase) {
-    let via_cargo = tc.draw(gs::booleans());
-    let runner: &[&str] = if via_cargo { &["--via-cargo"] } else { &[] };
-    let fixture = Fixture::new();
+    let reversed = tc.draw(gs::booleans());
+    for via_cargo in in_order([false, true], reversed) {
+        let runner: &[&str] = if via_cargo { &["--via-cargo"] } else { &[] };
+        let fixture = Fixture::new();
 
-    fixture.testcache_ok(runner);
-    assert_eq!(fixture.take_runs(), names(&ALL));
+        fixture.testcache_ok(runner);
+        assert_eq!(
+            fixture.take_runs(),
+            names(&ALL),
+            "first run, via cargo: {via_cargo}"
+        );
 
-    let second = fixture.testcache_ok(runner);
-    assert_eq!(fixture.take_runs(), BTreeSet::new());
-    assert!(stderr(&second).contains("0 run"), "{}", stderr(&second));
+        let second = fixture.testcache_ok(runner);
+        assert_eq!(
+            fixture.take_runs(),
+            BTreeSet::new(),
+            "second run, via cargo: {via_cargo}"
+        );
+        assert!(stderr(&second).contains("0 run"), "{}", stderr(&second));
+    }
 }
 
 // Property (9.2, 9.6): changing one crate re-runs exactly the binaries that depend on it; for
@@ -338,55 +356,71 @@ fn changed_test_arguments_rerun(tc: TestCase) {
     assert_eq!(fixture.take_runs(), BTreeSet::new());
 }
 
-// Property (9.7): --no-cache runs everything and records it.
-#[hegel::test(test_cases = 1)]
+// Property (9.7): --no-cache runs everything and records it, with and without --explain. Both
+// are checked in every case, in a drawn order, on one fixture: each step ends with every
+// binary recorded, which is where the next one starts.
+#[hegel::test(test_cases = 2)]
 fn no_cache_runs_everything(tc: TestCase) {
-    let explain = tc.draw(gs::booleans());
+    let reversed = tc.draw(gs::booleans());
     let fixture = Fixture::new();
     fixture.testcache_ok(&[]);
     fixture.take_runs();
 
-    let args: &[&str] = if explain {
-        &["--no-cache", "--explain"]
-    } else {
-        &["--no-cache"]
-    };
-    fixture.testcache_ok(args);
-    assert_eq!(fixture.take_runs(), names(&ALL));
-    fixture.testcache_ok(&[]);
-    assert_eq!(fixture.take_runs(), BTreeSet::new());
+    for explain in in_order([false, true], reversed) {
+        let args: &[&str] = if explain {
+            &["--no-cache", "--explain"]
+        } else {
+            &["--no-cache"]
+        };
+        fixture.testcache_ok(args);
+        assert_eq!(fixture.take_runs(), names(&ALL), "{args:?}");
+        fixture.testcache_ok(&[]);
+        assert_eq!(fixture.take_runs(), BTreeSet::new(), "after {args:?}");
+    }
 }
 
 // Property (9.8): `status` runs nothing and records nothing, and `clear` forgets every pass.
+// Checked before and after a recorded run in every case, each on a fresh fixture, in a drawn
+// order.
 #[hegel::test(test_cases = 2)]
 fn status_changes_nothing_and_clear_forgets(tc: TestCase) {
-    let ran_before = tc.draw(gs::booleans());
-    let fixture = Fixture::new();
-    if ran_before {
+    let reversed = tc.draw(gs::booleans());
+    for ran_before in in_order([false, true], reversed) {
+        let fixture = Fixture::new();
+        if ran_before {
+            fixture.testcache_ok(&[]);
+            fixture.take_runs();
+        }
+
+        let status = fixture.testcache_ok(&["status"]);
+        assert_eq!(
+            fixture.take_runs(),
+            BTreeSet::new(),
+            "ran before: {ran_before}"
+        );
+        let verb = if ran_before {
+            "Would skip"
+        } else {
+            "Would run"
+        };
+        assert!(stderr(&status).contains(verb), "{}", stderr(&status));
+
         fixture.testcache_ok(&[]);
-        fixture.take_runs();
+        let expected = if ran_before {
+            BTreeSet::new()
+        } else {
+            names(&ALL)
+        };
+        assert_eq!(fixture.take_runs(), expected, "ran before: {ran_before}");
+
+        fixture.testcache_ok(&["clear"]);
+        fixture.testcache_ok(&[]);
+        assert_eq!(
+            fixture.take_runs(),
+            names(&ALL),
+            "after clear, ran before: {ran_before}"
+        );
     }
-
-    let status = fixture.testcache_ok(&["status"]);
-    assert_eq!(fixture.take_runs(), BTreeSet::new());
-    let verb = if ran_before {
-        "Would skip"
-    } else {
-        "Would run"
-    };
-    assert!(stderr(&status).contains(verb), "{}", stderr(&status));
-
-    fixture.testcache_ok(&[]);
-    let expected = if ran_before {
-        BTreeSet::new()
-    } else {
-        names(&ALL)
-    };
-    assert_eq!(fixture.take_runs(), expected);
-
-    fixture.testcache_ok(&["clear"]);
-    fixture.testcache_ok(&[]);
-    assert_eq!(fixture.take_runs(), names(&ALL));
 }
 
 // Property (9.9, conformance): every test binary sees the same working directory and the same

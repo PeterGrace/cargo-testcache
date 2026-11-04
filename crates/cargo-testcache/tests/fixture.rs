@@ -320,55 +320,72 @@ fn changing_a_declared_input_reruns_what_it_covers(tc: TestCase) {
     );
 }
 
+/// Where a fixture test puts a Cargo `[env]` setting.
+#[derive(Debug, Clone, Copy)]
+enum EnvSetting {
+    /// In `.cargo/config.toml`.
+    InConfig,
+    /// In `.cargo/inc.toml`, which `.cargo/config.toml` includes.
+    Included,
+    /// As a `--config` argument.
+    Argument,
+}
+
 // Property: an `[env]` table in Cargo's configuration reaches every test binary, as under
 // `cargo test`, though the direct runner cannot apply it (the run falls back to Cargo), and
-// changing it reruns every binary. Checked with the table in `.cargo/config.toml` and given as
-// `--config`, each on a fresh fixture, in a drawn order.
+// changing it reruns every binary. Checked with the table in `.cargo/config.toml`, in a file
+// that `.cargo/config.toml` includes (only that file changes), and given as `--config`, each
+// on a fresh fixture, in a drawn order.
 #[hegel::test(test_cases = 2)]
 fn cargo_config_env_reaches_the_tests_and_is_keyed(tc: TestCase) {
-    let reversed = tc.draw(gs::booleans());
+    let rotation = tc.draw(gs::integers::<usize>().max_value(2));
     let first = tc.draw(gs::integers::<u32>()).to_string();
     let second = format!("{first}-changed");
-    for in_file in in_order([true, false], reversed) {
+    let mut settings = [
+        EnvSetting::InConfig,
+        EnvSetting::Included,
+        EnvSetting::Argument,
+    ];
+    settings.rotate_left(rotation);
+    for setting in settings {
         let fixture = Fixture::new();
         let run = |value: &str| {
-            let setting = format!("FIXTURE_CFG = \"{value}\"");
-            let config_arg = format!("env.{setting}");
-            let args: Vec<&str> = if in_file {
-                fs::create_dir_all(fixture.root.join(".cargo")).expect("create .cargo");
-                fixture.write(".cargo/config.toml", &format!("[env]\n{setting}\n"));
-                Vec::new()
-            } else {
-                vec!["--config", &config_arg]
+            let line = format!("FIXTURE_CFG = \"{value}\"");
+            let config_arg = format!("env.{line}");
+            let table = format!("[env]\n{line}\n");
+            fs::create_dir_all(fixture.root.join(".cargo")).expect("create .cargo");
+            let args: Vec<&str> = match setting {
+                EnvSetting::InConfig => {
+                    fixture.write(".cargo/config.toml", &table);
+                    Vec::new()
+                }
+                EnvSetting::Included => {
+                    fixture.write(".cargo/config.toml", "include = [\"inc.toml\"]\n");
+                    fixture.write(".cargo/inc.toml", &table);
+                    Vec::new()
+                }
+                EnvSetting::Argument => vec!["--config", &config_arg],
             };
             let output = fixture.testcache(&args, &[("FIXTURE_CFG_EXPECTED", OsStr::new(value))]);
             assert!(
                 output.status.success(),
-                "in a file: {in_file}, value {value}:\n{}",
+                "{setting:?}, value {value}:\n{}",
                 stderr(&output)
             );
             fixture.take_runs()
         };
 
-        assert_eq!(run(&first), names(&ALL), "first run, in a file: {in_file}");
-        assert_eq!(
-            run(&first),
-            BTreeSet::new(),
-            "unchanged, in a file: {in_file}"
-        );
-        assert_eq!(run(&second), names(&ALL), "changed, in a file: {in_file}");
+        assert_eq!(run(&first), names(&ALL), "first run, {setting:?}");
+        assert_eq!(run(&first), BTreeSet::new(), "unchanged, {setting:?}");
+        assert_eq!(run(&second), names(&ALL), "changed, {setting:?}");
         // Some binaries run, so each runs through `cargo test` on its own.
         fixture.write("alpha/fixtures/extra.txt", &second);
         assert_eq!(
             run(&second),
             names(&["alpha", "reads_input"]),
-            "one input changed, in a file: {in_file}"
+            "one input changed, {setting:?}"
         );
-        assert_eq!(
-            run(&second),
-            BTreeSet::new(),
-            "recorded, in a file: {in_file}"
-        );
+        assert_eq!(run(&second), BTreeSet::new(), "recorded, {setting:?}");
     }
 }
 

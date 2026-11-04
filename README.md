@@ -25,6 +25,12 @@ A test filter spelled exactly `status` or `clear` must be written after `--`
 | `--via-cargo` | Run each binary through `cargo test -p <pkg> --test <name>` instead of directly |
 | `--no-doc` | Skip doc tests (they are never cached) |
 
+`--via-cargo` often cannot record a pass. When only some binaries must run, it builds each
+target alone (`-p <pkg> --test <name>`), and Cargo then unifies features differently, so it
+often builds a different executable from the one that was hashed (2 of this repository's 4 test
+binaries). Such a binary runs but is never recorded, so it runs again every time. Prefer the
+direct runner.
+
 Declare what tests read at runtime in the root `Cargo.toml`; a package's own table adds to it,
 with `inputs` relative to the package. Globs must stay inside the workspace root: `../shared/**`
 in a package is fine, an absolute glob is refused, and a glob that matches no file is warned
@@ -38,9 +44,13 @@ always_run = ["*/live_*"]                        # package/target patterns never
 spawns = ["myapp-server"]                        # binaries spawned by path, under target/<profile>
 ```
 
-Any change to a `.cargo/config.toml` (in the working directory, its ancestors or `$CARGO_HOME`)
-or to a `--config` argument reruns every binary. When the configuration has an `[env]` table or
-a target runner, binaries run through `cargo test`, since only Cargo applies them.
+Any change to a `.cargo/config.toml` (in the working directory, its ancestors or `$CARGO_HOME`),
+to a file it `include`s, or to a `--config` argument reruns every binary. When the
+configuration has an `[env]` table or a target runner, binaries run through `cargo test`, since
+only Cargo applies them. That is the via-cargo runner, with the limit above: you get it without
+passing `--via-cargo`, and binaries that Cargo builds differently on their own are never
+recorded. Applying `[env]` in the direct runner, so that only runners need Cargo, is future
+work.
 
 The record lives in `<target-dir>/testcache/passes.jsonl`; `cargo clean` removes it too. Keep a
 plain `cargo test` in CI: the cache is for local iteration.

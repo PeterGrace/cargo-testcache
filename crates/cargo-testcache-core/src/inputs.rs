@@ -303,10 +303,7 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
 /// Each match.
 fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found> {
     let root = canonical_or_raw(workspace.root());
-    let skipped = [
-        canonical_or_raw(workspace.target_dir()),
-        canonical_or_raw(workspace.build_dir()),
-    ];
+    let skipped = SkippedDirs::new([workspace.target_dir(), workspace.build_dir()]);
     WalkDir::new(&root)
         .follow_links(true)
         .into_iter()
@@ -318,12 +315,7 @@ fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found>
             if !entry.file_type().is_dir() || entry.depth() == 0 {
                 return true;
             }
-            // Descendants of the canonical root are canonical, except symlinks.
-            let is_skipped = if entry.path_is_symlink() {
-                skipped.contains(&canonical_or_raw(entry.path()))
-            } else {
-                skipped.iter().any(|dir| dir == entry.path())
-            };
+            let is_skipped = skipped.contains(entry);
             let could_match = entry
                 .path()
                 .strip_prefix(&root)
@@ -355,6 +347,57 @@ fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found>
             })
         })
         .collect()
+}
+
+/// The directories the walk must not enter: the target and build directories.
+#[cfg(unix)]
+struct SkippedDirs(Vec<(u64, u64)>);
+
+#[cfg(unix)]
+impl SkippedDirs {
+    /// Records the identity (device and inode) of each directory that exists; one that cannot
+    /// be examined does not exist, so nothing is skipped for it. Identity holds however the
+    /// walk reaches the directory, even through a symlink to one of its parents.
+    fn new<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self(
+            dirs.into_iter()
+                .filter_map(|dir| dir.metadata().ok())
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .collect(),
+        )
+    }
+
+    /// Whether a walked directory is one of them. `walkdir` follows links here, so the
+    /// metadata is the link target's.
+    fn contains(&self, entry: &walkdir::DirEntry) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        entry
+            .metadata()
+            .is_ok_and(|metadata| self.0.contains(&(metadata.dev(), metadata.ino())))
+    }
+}
+
+/// The directories the walk must not enter: the target and build directories.
+#[cfg(not(unix))]
+struct SkippedDirs(Vec<PathBuf>);
+
+#[cfg(not(unix))]
+impl SkippedDirs {
+    /// Records each directory's canonical path (the raw path when that fails).
+    fn new<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Self {
+        Self(dirs.into_iter().map(canonical_or_raw).collect())
+    }
+
+    /// Whether a walked directory is one of them. Descendants of the canonical root are
+    /// canonical, except symlinks.
+    fn contains(&self, entry: &walkdir::DirEntry) -> bool {
+        if entry.path_is_symlink() {
+            self.0.contains(&canonical_or_raw(entry.path()))
+        } else {
+            self.0.iter().any(|dir| dir == entry.path())
+        }
+    }
 }
 
 /// The directory components before a glob's first wildcard, after its package directory.

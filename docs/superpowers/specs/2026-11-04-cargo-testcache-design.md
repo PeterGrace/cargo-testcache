@@ -1,6 +1,6 @@
 # cargo-testcache: skip test binaries that already passed
 
-Status: draft, 2026-11-04.
+Status: implemented (v1), 2026-11-04; see changelog/ for decisions taken during implementation.
 
 ## 1. Problem
 
@@ -220,8 +220,13 @@ The output ends with a line such as:
 testcache: 117 binaries, 9 run (7 changed, 2 never passed), 108 skipped; 1 failed
 ```
 
-It goes through `indicatif` progress output while binaries run, and plain lines when stdout is
-not a terminal.
+The progress bar is drawn on stderr, and becomes plain lines when stderr is not a terminal. It
+shows while inputs are hashed and between binaries, and is cleared while each test binary runs,
+so the binary's own output is not drawn over. Status lines name each binary with Cargo's labels,
+such as `unittests src/lib.rs (pkg/target)`.
+
+A positional `cargo test` filter (`cargo testcache foo`) is treated exactly like `-- foo`: it is
+passed to the test binaries and is part of the key.
 
 ## 7. Correctness and its limits
 
@@ -235,6 +240,7 @@ changed input that the key does not cover. The known uncovered inputs are:
 | Binaries spawned by path | `spawns` | An unlisted helper binary changes |
 | Randomized tests (hegel, proptest, quickcheck) | Nothing: a pass is cached like any other | The cache makes them explore less. Every rebuild of the binary explores again; `--no-cache` explores again on demand |
 | Time, network, machine state | Nothing | Same as any test that depends on them |
+| Sources edited between the build and a via-cargo run | Nothing | `--via-cargo` runs `cargo test`, which rebuilds; the pass is recorded under the key of the binary built earlier. Do not edit while a via-cargo run is in progress |
 
 What the tool does when it is unsure:
 

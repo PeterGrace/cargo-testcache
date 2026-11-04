@@ -25,7 +25,7 @@ Changelog entries **MUST** use this format, and nothing else:
 
 ## Project Layout
 
-- A Cargo workspace: `crates/cargo-testcache` is a thin binary (arguments, logging, signals); the application's logic lives in `crates/cargo-testcache-core` and other library crates under `crates/`, so tests and other crates can call it without a process.
+- A Cargo workspace: `crates/cargo-testcache` is a thin binary (command line, logging, exit status); the application's logic lives in `crates/cargo-testcache-core` and other library crates under `crates/`, so tests and other crates can call it without a process.
 - Shared dependency versions, lints and metadata live in the root `Cargo.toml` (`[workspace.dependencies]`, `[workspace.lints]`); member crates opt in with `<key>.workspace = true` and `[lints] workspace = true`.
 - Configuration comes from defaults, then `CARGO_TESTCACHE_*` environment variables (and `.env`), then command-line flags. Document every variable in `.env.example`.
 - Logs go to stderr, so stdout stays clean for data. Set the filter with `RUST_LOG`.

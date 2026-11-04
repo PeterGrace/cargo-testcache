@@ -2,7 +2,7 @@
 # crates and holds the settings they share. Members opt in with `<key>.workspace = true`, much
 # like inheriting from a shared base config.
 #
-# Layout: `crates/cargo-testcache` is a thin binary (CLI parsing, logging, signals);
+# Layout: `crates/cargo-testcache` is a thin binary (command line, logging, exit status);
 # `crates/cargo-testcache-core` is the library that holds the application's logic, so its
 # tests (and other crates) can call it directly. Add crates under `crates/`.
 [workspace]

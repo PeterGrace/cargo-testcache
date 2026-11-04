@@ -8,6 +8,7 @@ pub mod args;
 pub mod config;
 pub mod error;
 pub mod key;
+pub mod manifest;
 
 // Re-exports, so callers can write `cargo_testcache_core::Config` rather than the full path.
 pub use config::{Config, LogFormat};

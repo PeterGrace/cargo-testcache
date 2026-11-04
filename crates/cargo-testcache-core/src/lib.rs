@@ -11,6 +11,7 @@ pub mod error;
 pub mod inputs;
 pub mod key;
 pub mod manifest;
+pub mod plan;
 pub mod store;
 pub mod workspace;
 

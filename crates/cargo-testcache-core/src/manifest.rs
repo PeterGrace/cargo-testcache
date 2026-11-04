@@ -65,6 +65,9 @@ impl TestcacheConfig {
 
 /// Compiles one glob, with `*` and `?` stopping at `/` (only `**` crosses directories).
 ///
+/// Globs use `/` separators on every platform, `\` escapes the next character on every
+/// platform, and matching is case-sensitive, even on case-insensitive file systems.
+///
 /// # Arguments
 ///
 /// * `pattern` - The glob.
@@ -79,6 +82,7 @@ impl TestcacheConfig {
 pub fn glob(pattern: &str) -> Result<Glob> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
+        .backslash_escape(true)
         .build()
         .map_err(|source| Error::InvalidGlob {
             pattern: pattern.to_owned(),
@@ -113,7 +117,8 @@ impl AlwaysRun {
             .build()
             .map(Self)
             .map_err(|source| Error::InvalidGlob {
-                pattern: "always_run".to_owned(),
+                // `build` fails only on whole-set limits, so no single user pattern is to blame.
+                pattern: "the always_run patterns together".to_owned(),
                 source,
             })
     }
@@ -140,6 +145,8 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators::{self as gs, Generator};
     use serde_json::json;
+
+    const KEYS: [&str; 4] = ["inputs", "env", "always_run", "spawns"];
 
     fn draw_list(tc: &TestCase) -> Vec<String> {
         tc.draw(gs::vecs(gs::text().max_size(10)).max_size(3))
@@ -187,14 +194,42 @@ mod tests {
         assert_eq!(read, TestcacheConfig::default());
     }
 
-    // Property: a misspelt key is an error that names the table it is in.
+    // Property: an unknown key is an error that names the table it is in.
     #[hegel::test]
     fn unknown_keys_are_refused_with_their_location(tc: TestCase) {
         let location = draw_name(&tc);
-        let metadata = json!({ "testcache": { "inptus": ["x"] } });
+        let key = tc.draw(gs::text().filter(|key: &String| !KEYS.contains(&key.as_str())));
+        let metadata = json!({ "testcache": { key: ["x"] } });
 
         let error = TestcacheConfig::from_metadata(Some(&metadata), &location)
             .expect_err("unknown keys are refused");
+
+        assert!(
+            matches!(&error, Error::InvalidManifest { location: at, .. } if *at == location),
+            "{error:?}"
+        );
+    }
+
+    // Property: a value of the wrong type is an error that names the table it is in.
+    #[hegel::test]
+    fn wrong_types_are_refused_with_their_location(tc: TestCase) {
+        let location = draw_name(&tc);
+        let key = tc.draw(gs::sampled_from(KEYS.to_vec()));
+        // The array has at least one number: an empty array is a valid list of strings.
+        let value = tc.draw(hegel::one_of!(
+            gs::text().map(Value::from),
+            gs::integers::<i64>().map(Value::from),
+            gs::vecs(gs::integers::<i64>())
+                .min_size(1)
+                .max_size(3)
+                .map(Value::from),
+        ));
+        let mut table = serde_json::Map::new();
+        table.insert(key.to_owned(), value);
+        let metadata = json!({ "testcache": table });
+
+        let error = TestcacheConfig::from_metadata(Some(&metadata), &location)
+            .expect_err("a wrong type is refused");
 
         assert!(
             matches!(&error, Error::InvalidManifest { location: at, .. } if *at == location),

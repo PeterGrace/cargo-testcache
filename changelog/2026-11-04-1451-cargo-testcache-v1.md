@@ -115,8 +115,13 @@ Taken during implementation:
   - an invalid `--log-format` exits 2 (clap's usage error).
 - report: examples get Cargo's `unittests` label; the progress bar has a steady tick and names
   the running binary.
-- store: lock-contention properties; a spawn mutex in tests, because `flock` is briefly shared
-  across fork/exec.
+- store:
+  - the lock is std's `File::lock` (stable since Rust 1.89, hence the MSRV), not `fs4`: one
+    dependency fewer, and std opens files close-on-exec, as the design requires;
+  - lock-contention properties; a spawn mutex in tests, because `flock` is briefly shared
+    across fork/exec.
+- workspace: a package's `always_run` patterns are not scoped to that package; they join one
+  workspace-wide set matched against `package/target`, unlike `inputs`.
 - fixture tests:
   - every variant runs on every case (CI derandomizes Hegel, and random draws missed variants);
   - the conformance test runs with and without a separate build dir and with an `alpha` build
@@ -124,6 +129,14 @@ Taken during implementation:
   - mutation testing showed the fixture tests catch a wrong skip, keys ignoring inputs, args or
     spawned bins, a missing `OUT_DIR`, recorded failures, and the wrong working directory;
   - the fixture is formatted by `just fmt`/`fmt-check`.
+
+Fixed after the final branch review (changelog/2026-11-04-1526-review-fixes.md):
+
+- Cargo's configuration is a key part, and an `[env]` table makes the run use Cargo;
+- a via-cargo pass is recorded only when Cargo builds the hashed executable for that target;
+- input globs resolve `.` and `..`, and globs that can never match are refused or warned
+  about;
+- a pass is recorded only if the executable and spawned binaries are unchanged after the run.
 
 ## Not done
 

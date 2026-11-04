@@ -101,6 +101,10 @@ prefixes:
    `--include-ignored`. A pass with a filter says nothing about the tests the filter excluded.
 6. **The tool:** cargo-testcache's version and the key-format version, so an upgrade never
    reuses a key computed differently.
+7. **Cargo configuration:** a digest of every Cargo config file Cargo reads for the invocation
+   (`.cargo/config.toml` and `.cargo/config` in the working directory and each ancestor, then
+   in `$CARGO_HOME`) and every `--config` value, in order. Coarse: any change reruns every
+   binary. An `[env]` table makes the run use the via-cargo runner, since only Cargo applies it.
 
 Two inputs need no key part:
 
@@ -168,10 +172,10 @@ the binary directly.
   key, the package and target, the time of the pass, the duration, and the passed and ignored
   counts parsed from libtest's summary when present.
 - **Writes:** append-only, and only after the binary exits 0.
-- **Concurrency:** an advisory lock (`fs4` or `fd-lock`) serializes concurrent runs in one target
-  directory. When the lock is taken, it is opened with close-on-exec so a spawned daemon such as
-  sccache can't inherit it. A daemon that inherits the lock holds it forever and blocks every
-  later run.
+- **Concurrency:** an advisory lock (std's `File::lock`, as implemented) serializes concurrent
+  runs in one target directory. When the lock is taken, it is opened with close-on-exec so a
+  spawned daemon such as sccache can't inherit it. A daemon that inherits the lock holds it
+  forever and blocks every later run.
 - **Pruning:** at startup the file is compacted to the newest line per (package, target), so it
   stays one line per binary.
 - **Clearing:** `cargo clean` removes the cache along with everything else, because it lives in
@@ -221,7 +225,8 @@ testcache: 117 binaries, 9 run (7 changed, 2 never passed), 108 skipped; 1 faile
 ```
 
 The progress bar is drawn on stderr, and becomes plain lines when stderr is not a terminal. It
-shows while inputs are hashed and between binaries, and is cleared while each test binary runs,
+shows while test binaries are hashed and between binaries (hashing the `inputs` files has no
+progress bar), and is cleared while each test binary runs,
 so the binary's own output is not drawn over. Status lines name each binary with Cargo's labels,
 such as `unittests src/lib.rs (pkg/target)`.
 
@@ -240,7 +245,10 @@ changed input that the key does not cover. The known uncovered inputs are:
 | Binaries spawned by path | `spawns` | An unlisted helper binary changes |
 | Randomized tests (hegel, proptest, quickcheck) | Nothing: a pass is cached like any other | The cache makes them explore less. Every rebuild of the binary explores again; `--no-cache` explores again on demand |
 | Time, network, machine state | Nothing | Same as any test that depends on them |
-| Sources edited between the build and a via-cargo run | Nothing | `--via-cargo` runs `cargo test`, which rebuilds; the pass is recorded under the key of the binary built earlier. Do not edit while a via-cargo run is in progress |
+| Binaries relinked between hashing and the end of the run (sources edited before a via-cargo run, which rebuilds; another terminal's `cargo build`) | The executable and spawned binaries are hashed again after a pass, which is recorded only if every digest is unchanged | Nothing known. An input edited during the run is recorded with its old digest, so the next run reruns |
+| A different binary built for one target under `--via-cargo` (feature unification) | Before running one target through Cargo, its `--no-run` build must report the hashed executable, or the pass is not recorded | Nothing known |
+| Shared libraries in build-script link-search directories | Nothing: only executables are hashed | A rebuilt `.so`/`.dylib` that a test loads at runtime, with an unchanged test executable |
+| Cargo configuration (`.cargo/config.toml`, `--config`) | Keyed coarsely: a digest of every config file and `--config` value | Configuration from environment variables (`CARGO_*`), which is not keyed; a runner set in a config file is keyed but not applied by the direct runner |
 
 What the tool does when it is unsure:
 
@@ -266,13 +274,15 @@ The template's two-crate layout:
     `testcache` as the first argument;
   - output and the exit status.
 
-**Dependencies:**
-- `cargo_metadata` for metadata and messages;
+**Dependencies** (as implemented; the changelog has why `cargo_metadata` and `fs4` were
+dropped):
+- own serde structs for metadata and messages;
 - `sha2` for hashing;
 - `globset` and `walkdir` for inputs;
 - `serde` and `serde_json` for the store;
-- `fs4` for the lock;
-- `clap`, `indicatif`, `thiserror` and `anyhow`.
+- std's `File::lock` for the lock;
+- `toml` to see whether Cargo's configuration has an `[env]` table;
+- `clap`, `indicatif`, `rayon`, `thiserror` and `anyhow`.
 
 ## 9. Testing
 

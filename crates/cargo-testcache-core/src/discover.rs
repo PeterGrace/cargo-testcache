@@ -307,6 +307,7 @@ mod tests {
         let mut output: Vec<String> = fed.iter().map(line).collect();
         output.push(json!({ "reason": "build-finished", "success": true }).to_string());
         output.push("not json".to_owned());
+        output.push(json!({ "reason": "compiler-artifact", "package_id": "p1" }).to_string());
         output.push(
             json!({ "reason": "build-script-executed", "package_id": "p1",
                 "linked_libs": [], "linked_paths": ["native=/t/native", "/t/plain"],
@@ -314,7 +315,11 @@ mod tests {
             .to_string(),
         );
 
-        let build = parse(Cursor::new(output.join("\n"))).expect("parse");
+        // Bytes, not a String: a line that is not UTF-8 must be skipped, not abort the parse.
+        let mut bytes: Vec<u8> = output.join("\n").into_bytes();
+        bytes.extend_from_slice(b"\n\xff\xfe\n");
+
+        let build = parse(Cursor::new(bytes)).expect("parse");
 
         let expected: Vec<(String, String)> = fed
             .iter()

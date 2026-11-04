@@ -74,6 +74,9 @@ pub struct SplitArgs {
     pub cargo: CargoArgs,
     /// Arguments for every test binary (after `--`).
     pub test: Vec<OsString>,
+    /// Whether the first of `test` is a positional `cargo test` filter moved there, rather than
+    /// something that followed `--`.
+    pub starts_with_filter: bool,
 }
 
 /// Splits the command line.
@@ -144,6 +147,7 @@ pub fn split(
     }
     if let Some(name) = take_test_name(&mut split.cargo.0) {
         split.test.insert(0, name);
+        split.starts_with_filter = true;
     }
     split
 }

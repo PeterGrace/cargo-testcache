@@ -32,6 +32,7 @@ const TEST_FAILURE_EXIT: u8 = 101;
     name = "cargo-testcache",
     bin_name = "cargo testcache",
     version,
+    disable_help_subcommand = true,
     override_usage = "cargo testcache [OPTIONS] [CARGO TEST ARGS] [-- TEST BINARY ARGS]\n       \
                       cargo testcache status [OPTIONS] [CARGO TEST ARGS]\n       \
                       cargo testcache clear"
@@ -61,6 +62,7 @@ struct Cli {
 #[derive(Debug, Clone, Copy, Subcommand)]
 enum Mode {
     /// List what would run and what would be skipped, without running anything.
+    #[command(override_usage = "cargo testcache status [OPTIONS] [CARGO TEST ARGS]")]
     Status,
     /// Forget every recorded pass.
     Clear,
@@ -69,7 +71,11 @@ enum Mode {
 // `main` returns an `ExitCode` instead of calling `exit`, so destructors run (the store's lock
 // is released) and errors are logged through tracing first.
 fn main() -> ExitCode {
-    let SplitArgs { own, cargo, test } = split_command_line(std::env::args_os().skip(1));
+    let split = split_command_line(std::env::args_os().skip(1));
+    let misplaced = misplaced_subcommand(&split);
+    let SplitArgs {
+        own, cargo, test, ..
+    } = split;
     // `--help`, `--version` and usage errors print and exit here.
     let cli = Cli::parse_from(std::iter::once(OsString::from("cargo-testcache")).chain(own));
     let (config, dotenv_warnings) = load_config();
@@ -85,6 +91,9 @@ fn main() -> ExitCode {
     for warning in dotenv_warnings {
         warn!("{warning}");
     }
+    if let Some(name) = misplaced {
+        warn!("`{name}` was taken as a test-name filter; put the subcommand first");
+    }
 
     let outcome = config
         .context("loading configuration")
@@ -96,11 +105,21 @@ fn main() -> ExitCode {
             ExitCode::from(u8::try_from(code).unwrap_or(TEST_FAILURE_EXIT))
         }
         Err(run_error) => {
-            // `{:#}` prints the whole context chain: "cargo testcache: running cargo ...".
+            // `{:#}` prints the whole context chain, e.g. "cargo testcache: <cause>" or
+            // "clearing the recorded passes: <cause>".
             error!("{run_error:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// The subcommand name that was taken as a positional test-name filter, if any.
+fn misplaced_subcommand(split: &SplitArgs) -> Option<String> {
+    let name = split.test.first()?.to_str()?;
+    let is_subcommand = Cli::command()
+        .get_subcommands()
+        .any(|command| command.get_name() == name);
+    (split.starts_with_filter && is_subcommand).then(|| name.to_owned())
 }
 
 /// Splits the command line, recognizing exactly the options and subcommands clap defines.
@@ -114,7 +133,8 @@ fn main() -> ExitCode {
 /// The tool's own arguments, `cargo test`'s, and the test binaries'.
 fn split_command_line(args: impl IntoIterator<Item = OsString>) -> SplitArgs {
     let mut command = Cli::command();
-    // `build` adds clap's own `--help`/`-h`, `--version`/`-V` and `help` subcommand.
+    // `build` adds clap's own `--help`/`-h` and `--version`/`-V` (the `help` subcommand is
+    // disabled, so `help` stays a test filter).
     command.build();
     let options: HashMap<String, Arity> = command
         .get_arguments()
@@ -206,24 +226,42 @@ mod tests {
     // rest goes to cargo, and clap then parses what was recognized.
     #[hegel::test]
     fn own_options_are_recognized_among_cargo_arguments(tc: TestCase) {
-        let own = tc.draw(gs::subsequences(
-            &[
-                "--no-cache",
-                "--explain",
-                "--via-cargo",
-                "--no-doc",
-                "--log-format=json",
-            ][..],
-        ));
+        let flags = ["--no-cache", "--explain", "--via-cargo", "--no-doc"];
         let cargo = ["-p", "alpha", "--release"];
         let status = tc.draw(gs::booleans());
+        let json = tc.draw(gs::booleans());
+        let separate_value = tc.draw(gs::booleans());
+        let mut own: Vec<Vec<&str>> = Vec::new();
+        for flag in flags {
+            if tc.draw(gs::booleans()) {
+                own.push(vec![flag]);
+            }
+        }
+        if json {
+            own.push(if separate_value {
+                vec!["--log-format", "json"]
+            } else {
+                vec!["--log-format=json"]
+            });
+        }
+        // Insert each own option (with its value) at a drawn gap between cargo arguments,
+        // never between `-p` and its value.
+        let gaps = [0, 2, 3];
+        let mut slots: Vec<Vec<&str>> = vec![Vec::new(); gaps.len()];
+        for option in &own {
+            slots[tc.draw(gs::integers::<usize>().max_value(gaps.len() - 1))].extend(option);
+        }
         let mut argv: Vec<OsString> = vec!["testcache".into()];
         if status {
             argv.push("status".into());
         }
-        argv.extend(cargo[..2].iter().map(OsString::from));
-        argv.extend(own.iter().map(OsString::from));
-        argv.push(cargo[2].into());
+        let mut previous = 0;
+        for (slot, gap) in slots.iter().zip(gaps) {
+            argv.extend(cargo[previous..gap].iter().map(OsString::from));
+            argv.extend(slot.iter().map(OsString::from));
+            previous = gap;
+        }
+        argv.extend(cargo[previous..].iter().map(OsString::from));
         argv.extend(["--", "--explain"].map(OsString::from));
 
         let split = split_command_line(argv);
@@ -232,11 +270,14 @@ mod tests {
         )
         .expect("the recognized options parse");
 
+        let has = |flag: &str| own.iter().any(|option| option[0] == flag);
         assert_eq!(split.cargo.as_slice(), cargo.map(OsString::from).as_slice());
         assert_eq!(split.test, [OsString::from("--explain")]);
-        assert_eq!(cli.explain, own.contains(&"--explain"));
-        assert_eq!(cli.via_cargo, own.contains(&"--via-cargo"));
-        assert_eq!(cli.log_format.is_some(), own.contains(&"--log-format=json"));
+        assert_eq!(cli.no_cache, has("--no-cache"));
+        assert_eq!(cli.explain, has("--explain"));
+        assert_eq!(cli.via_cargo, has("--via-cargo"));
+        assert_eq!(cli.no_doc, has("--no-doc"));
+        assert_eq!(cli.log_format.is_some(), json);
         assert_eq!(matches!(cli.mode, Some(Mode::Status)), status);
     }
 }

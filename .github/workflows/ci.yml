@@ -46,9 +46,11 @@ jobs:
       - run: just clippy
       - run: just doc
 
-  # `cargo-dylint` and `dylint-link` must match the trailofbits tag in Cargo.toml's
-  # `[workspace.metadata.dylint]`; bump them together. The first run on a new tag builds the
-  # lint libraries on their nightly, which takes a few minutes; the cache keeps them after.
+  # `cargo-dylint` and `dylint-link` build the driver the lint libraries in Cargo.toml's
+  # `[workspace.metadata.dylint]` load into. 6.0.4's driver no longer builds (its build script
+  # fails on `revparse_ext ... master`); 6.3.0 builds and loads the v6.0.4 libraries, which is
+  # also what local runs use. The first run on a new driver builds the lint libraries on their
+  # nightly, which takes a few minutes; the cache keeps them after.
   dylint:
     name: dylint
     runs-on: ubuntu-latest
@@ -57,7 +59,7 @@ jobs:
       - run: rustup toolchain install
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: just,cargo-dylint@6.0.4,dylint-link@6.0.4
+          tool: just,cargo-dylint@6.3.0,dylint-link@6.3.0
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

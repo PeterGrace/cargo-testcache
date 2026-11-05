@@ -773,13 +773,23 @@ fn conformance_dumps(separate_build_dir: bool, cargo_first: bool) -> Dumps {
     dumps
 }
 
-/// A test binary's environment dump, without `FIXTURE_DUMP_DIR`.
+/// Variables left out of the comparison, because the test harness itself causes them.
+///
+/// - `FIXTURE_DUMP_DIR` differs between the two runs by construction.
+/// - `__LLVM_PROFILE_RT_INIT_ONCE` is set in its own process by the LLVM profiling runtime of a
+///   coverage-instrumented `cargo-testcache` (`just coverage` in CI), and the test binaries it
+///   runs directly inherit it. A normally built `cargo-testcache` never sets it.
+const HARNESS_VARIABLES: [&str; 2] = ["FIXTURE_DUMP_DIR", "__LLVM_PROFILE_RT_INIT_ONCE"];
+
+/// A test binary's environment dump, without the [`HARNESS_VARIABLES`].
 fn read_dump(dir: &Path, name: &str) -> Vec<String> {
     fs::read_to_string(dir.join(format!("{name}.env")))
         .unwrap_or_else(|error| panic!("{name} dumped its environment: {error}"))
         .lines()
-        // The dump directory differs between the two runs by construction.
-        .filter(|line| !line.starts_with("FIXTURE_DUMP_DIR="))
+        .filter(|line| {
+            let name = line.split_once('=').map_or(*line, |(name, _)| name);
+            !HARNESS_VARIABLES.contains(&name)
+        })
         .map(str::to_owned)
         .collect()
 }

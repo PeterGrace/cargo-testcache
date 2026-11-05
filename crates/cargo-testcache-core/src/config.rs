@@ -21,6 +21,30 @@ pub const ENV_PREFIX: &str = "CARGO_TESTCACHE_";
 /// Environment variable naming the log format, `text` or `json`.
 pub const LOG_FORMAT_VAR: &str = "CARGO_TESTCACHE_LOG_FORMAT";
 
+/// Environment variable that turns off reusing remembered digests (`1` or `true`), as
+/// `--no-stat-cache` does: every test executable is hashed in full.
+pub const FULL_HASH_VAR: &str = "CARGO_TESTCACHE_FULL_HASH";
+
+/// An on/off environment value: `1`/`true` or `0`/`false`, in any letter case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Switch(bool);
+
+impl FromStr for Switch {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "1" || value.eq_ignore_ascii_case("true") {
+            Ok(Self(true))
+        } else if value == "0" || value.eq_ignore_ascii_case("false") {
+            Ok(Self(false))
+        } else {
+            Err(Error::InvalidSwitch {
+                value: value.to_owned(),
+            })
+        }
+    }
+}
+
 /// How log lines are written to stderr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
@@ -66,6 +90,7 @@ impl fmt::Display for LogFormat {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     log_format: LogFormat,
+    full_hash: bool,
 }
 
 impl Config {
@@ -99,11 +124,13 @@ impl Config {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
         let mut problems = Vec::new();
         let log_format = parse_var(&lookup, LOG_FORMAT_VAR, &mut problems);
+        let full_hash = parse_var::<Switch>(&lookup, FULL_HASH_VAR, &mut problems);
         if !problems.is_empty() {
             return Err(Error::InvalidConfig { problems });
         }
         Ok(Self {
             log_format: log_format.unwrap_or_default(),
+            full_hash: full_hash.is_some_and(|Switch(on)| on),
         })
     }
 
@@ -125,6 +152,22 @@ impl Config {
     /// How log lines are written.
     pub fn log_format(&self) -> LogFormat {
         self.log_format
+    }
+
+    /// Turns full hashing on, for `--no-stat-cache`.
+    ///
+    /// # Returns
+    ///
+    /// The updated configuration.
+    #[must_use]
+    pub fn with_full_hash(mut self) -> Self {
+        self.full_hash = true;
+        self
+    }
+
+    /// Whether every test executable is hashed in full, ignoring remembered digests.
+    pub fn full_hash(&self) -> bool {
+        self.full_hash
     }
 }
 
@@ -216,6 +259,42 @@ mod tests {
         };
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].starts_with(LOG_FORMAT_VAR), "{problems:?}");
+    }
+
+    // Property: the full-hash switch reads 1/true as on and 0/false (or unset) as off, in any
+    // letter case, and anything else is reported under its name; `with_full_hash` turns it on.
+    #[hegel::test]
+    fn the_full_hash_switch_is_read(tc: TestCase) {
+        let value = tc.draw(gs::optional(gs::sampled_from(vec![
+            "1", "0", "true", "FALSE", "True", "yes", "", "2",
+        ])));
+        let flag = tc.draw(gs::booleans());
+        let mut vars = HashMap::new();
+        if let Some(value) = value {
+            vars.insert(FULL_HASH_VAR, value.to_owned());
+        }
+
+        let config = Config::from_lookup(lookup_in(&vars));
+
+        let on = match value.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("0" | "false") => Some(false),
+            Some("1" | "true") => Some(true),
+            Some(_) => None,
+        };
+        match (config, on) {
+            (Ok(config), Some(on)) => {
+                let config = if flag {
+                    config.with_full_hash()
+                } else {
+                    config
+                };
+                assert_eq!(config.full_hash(), on || flag, "{value:?}");
+            }
+            (Err(Error::InvalidConfig { problems }), None) => {
+                assert!(problems[0].starts_with(FULL_HASH_VAR), "{problems:?}");
+            }
+            (config, on) => panic!("{value:?} gave {config:?}, expected {on:?}"),
+        }
     }
 
     // Property: a command-line override wins over whatever the environment set.

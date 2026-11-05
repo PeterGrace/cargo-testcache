@@ -113,6 +113,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "hegeltest",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

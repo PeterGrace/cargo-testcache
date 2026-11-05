@@ -13,6 +13,7 @@ use crate::cargo_config::CargoConfig;
 use crate::discover::{self, Build, TargetId, TargetKind, TestBinary};
 use crate::error::{Error, Result};
 use crate::exec::{self, LIBRARY_PATH_VAR, RunContext, Toolchain};
+use crate::hashes::HashCache;
 use crate::inputs::{InputIndex, InputLevel};
 use crate::key::{self, Digest, KeyParts, PartResult};
 use crate::plan::{self, Change, Decision, Policy, RunReason};
@@ -55,6 +56,9 @@ pub struct Options {
     pub via_cargo: bool,
     /// `--no-doc`: skip doc tests.
     pub no_doc: bool,
+    /// `--no-stat-cache` or `CARGO_TESTCACHE_FULL_HASH`: hash every executable in full instead
+    /// of reusing digests remembered for unchanged metadata.
+    pub full_hash: bool,
     /// The arguments for `cargo test`.
     pub cargo_args: CargoArgs,
     /// The arguments after `--`.
@@ -126,7 +130,10 @@ pub fn run(options: &Options) -> Result<Outcome> {
     if !status.success() {
         return Ok(Outcome::Exited(status.code().unwrap_or(FAILURE_CODE)));
     }
-    let mut store = Store::open(&workspace.cache_dir())?;
+    let cache_dir = workspace.cache_dir();
+    let mut store = Store::open(&cache_dir)?;
+    // Read and written only while the store's lock is held.
+    let mut hashes = HashCache::load(&cache_dir, !options.full_hash);
     let cargo_config = CargoConfig::load(&options.cargo_args);
     let session = Session {
         cargo: &cargo,
@@ -135,11 +142,23 @@ pub fn run(options: &Options) -> Result<Outcome> {
         cargo_config: &cargo_config,
         options,
     };
-    let planned = session.plan(&store)?;
+    let planned = session.plan(&store, &mut hashes)?;
+    // Saved before anything runs, so the hashing is kept even if the run is interrupted.
+    save_hashes(&mut hashes, &cache_dir);
     if options.status_only {
         return Ok(report_status(&planned));
     }
-    session.execute(&mut store, planned)
+    let outcome = session.execute(&mut store, &mut hashes, planned);
+    save_hashes(&mut hashes, &cache_dir);
+    outcome
+}
+
+/// Writes the remembered digests back. A failure costs only hashing on the next run, so it is
+/// warned about rather than failing this one.
+fn save_hashes(hashes: &mut HashCache, dir: &Path) {
+    if let Err(error) = hashes.save(dir) {
+        tracing::warn!("not remembering file digests: {error}");
+    }
 }
 
 /// Forgets every recorded pass of the workspace.
@@ -201,7 +220,7 @@ struct KeyContext<'a> {
 // compiler name it.
 impl Session<'_> {
     /// Hashes everything and decides, for each binary in run order, whether it runs.
-    fn plan(&self, store: &Store) -> Result<Vec<Planned<'_>>> {
+    fn plan(&self, store: &Store, hashes: &mut HashCache) -> Result<Vec<Planned<'_>>> {
         let binaries = ordered_binaries(self.workspace, self.build)?;
         let spawned: Vec<_> = binaries
             .iter()
@@ -219,7 +238,7 @@ impl Session<'_> {
                     .flatten()
                     .map(|(_, path)| path.as_path()),
             );
-        let digests = hash_files(to_hash);
+        let digests = hash_files(to_hash, hashes);
         let inputs = InputIndex::collect(self.workspace)?;
         let environment: BTreeMap<OsString, OsString> = env::vars_os().collect();
         let always_run = self.workspace.always_run()?;
@@ -265,7 +284,12 @@ impl Session<'_> {
     }
 
     /// Runs what has to run, records the passes, runs doc tests and prints the summary.
-    fn execute(&self, store: &mut Store, planned: Vec<Planned<'_>>) -> Result<Outcome> {
+    fn execute(
+        &self,
+        store: &mut Store,
+        hashes: &mut HashCache,
+        planned: Vec<Planned<'_>>,
+    ) -> Result<Outcome> {
         let options = self.options;
         let to_run = planned
             .iter()
@@ -301,7 +325,7 @@ impl Session<'_> {
         }
         let via_cargo = options.via_cargo || ruled_out.is_some();
         if via_cargo && to_run == planned.len() && to_run > 0 && !options.no_doc {
-            return self.run_whole(store, planned);
+            return self.run_whole(store, hashes, planned);
         }
         // `filter` turns `Some` into `None` when a runner forces cargo: then no direct-run
         // context exists, and each binary gets a via-cargo command below.
@@ -377,7 +401,7 @@ impl Session<'_> {
                             ));
                         }
                     } else {
-                        record_pass(store, planned, passed, outcome.duration, |line| {
+                        record_pass(store, hashes, planned, passed, outcome.duration, |line| {
                             progress.line(line);
                         })?;
                     }
@@ -405,7 +429,12 @@ impl Session<'_> {
     /// This runs the user's own arguments, unchanged, so Cargo selects the same packages and
     /// unifies features as the `--no-run` build that was hashed did: it runs the hashed
     /// executables, and needs no per-target build check.
-    fn run_whole(&self, store: &mut Store, planned: Vec<Planned<'_>>) -> Result<Outcome> {
+    fn run_whole(
+        &self,
+        store: &mut Store,
+        hashes: &mut HashCache,
+        planned: Vec<Planned<'_>>,
+    ) -> Result<Outcome> {
         let options = self.options;
         if options.explain {
             for planned in &planned {
@@ -433,7 +462,7 @@ impl Session<'_> {
             passed,
         );
         for planned in planned {
-            record_pass(store, planned, passed, outcome.duration, |line| {
+            record_pass(store, hashes, planned, passed, outcome.duration, |line| {
                 eprintln!("{line}");
             })?;
         }
@@ -497,9 +526,13 @@ fn different_binary_detail(ruled_out: Option<&str>) -> String {
 /// in its key: another build relinked them between hashing and the end of the run, so the pass
 /// may be the other build's. That last case is reported through `say`.
 ///
+/// The files are checked through `hashes`: one whose metadata still matches a remembered
+/// digest is not read again, and one that is read is remembered if its times have settled.
+///
 /// # Arguments
 ///
 /// * `store` - Where passes are recorded.
+/// * `hashes` - The remembered digests.
 /// * `planned` - The binary that ran.
 /// * `passed` - Whether it exited 0.
 /// * `duration` - How long it ran.
@@ -510,6 +543,7 @@ fn different_binary_detail(ruled_out: Option<&str>) -> String {
 /// When the store cannot be written.
 fn record_pass(
     store: &mut Store,
+    hashes: &mut HashCache,
     planned: Planned<'_>,
     passed: bool,
     duration: Duration,
@@ -521,16 +555,18 @@ fn record_pass(
     if !passed {
         return Ok(());
     }
-    let binary = Digest::of_file(&planned.binary.executable).ok();
+    let mut digest = |path: &Path| {
+        hashes
+            .digest(path)
+            .ok()
+            .map(|hashed| hashes.remember(path, hashed))
+    };
+    let binary = digest(&planned.binary.executable);
     // Collecting `Option`s into one `Option` gives `None` if any file cannot be read.
     let spawned: Option<BTreeMap<String, Digest>> = planned
         .spawned
         .iter()
-        .map(|(name, path)| {
-            Digest::of_file(path)
-                .ok()
-                .map(|digest| (name.clone(), digest))
-        })
+        .map(|(name, path)| digest(path).map(|digest| (name.clone(), digest)))
         .collect();
     if !unchanged_since_hashing(&parts, binary, spawned.as_ref()) {
         say(&report::status_line(
@@ -682,25 +718,36 @@ fn spawned_paths(
     Ok(paths)
 }
 
-/// Hashes every distinct file once, in parallel, with a progress bar.
+/// Digests every distinct file once, in parallel, with a progress bar: a remembered digest
+/// while the file's metadata is unchanged, else its hash, which is then remembered.
 fn hash_files<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
+    hashes: &mut HashCache,
 ) -> HashMap<PathBuf, PartResult<Digest>> {
     let unique: HashSet<&Path> = paths.into_iter().collect();
     let progress = Progress::new(unique.len(), "hashing test binaries");
     // `into_par_iter` (rayon) spreads the work over a thread pool, like a
-    // `ThreadPoolExecutor.map` that also collects the results into a dict.
-    let digests = unique
+    // `ThreadPoolExecutor.map`. The threads share `hashes` read-only (`&*` reborrows the
+    // `&mut` as `&`); what they hashed is remembered afterwards, on this thread.
+    let shared = &*hashes;
+    let hashed: Vec<_> = unique
         .into_par_iter()
         .map(|path| {
-            let digest = Digest::of_file(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()));
+            let hashed = shared.digest(path);
             progress.inc();
-            (path.to_path_buf(), digest)
+            (path, hashed)
         })
         .collect();
     progress.finish();
-    digests
+    hashed
+        .into_iter()
+        .map(|(path, hashed)| {
+            let digest = hashed
+                .map(|hashed| hashes.remember(path, hashed))
+                .map_err(|error| format!("cannot read {}: {error}", path.display()));
+            (path.to_path_buf(), digest)
+        })
+        .collect()
 }
 
 /// A binary's key parts, or why one of them cannot be computed.

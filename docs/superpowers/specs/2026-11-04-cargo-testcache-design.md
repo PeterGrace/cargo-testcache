@@ -87,7 +87,12 @@ Each test binary's cache key is a SHA-256 over these parts, in a fixed order wit
 prefixes:
 
 1. **The binary:** the SHA-256 of the executable file. Cargo relinks only when an input
-   changed, so an unchanged binary is the strongest single signal.
+   changed, so an unchanged binary is the strongest single signal. Since issue #9, a digest is
+   remembered in `<target-dir>/testcache/hashes.json` with the file's size, modification and
+   change times (nanoseconds), inode and device, and reused while they match, so a warm run
+   reads only metadata. A file whose times are within 2 s of when its metadata was read is not
+   remembered (git's racy rule). `--no-stat-cache` or `CARGO_TESTCACHE_FULL_HASH=1` hashes in
+   full. See `crates/cargo-testcache-core/src/hashes.rs`.
 2. **Spawned binaries:** for an integration test or a benchmark, the hashes of every `bin`
    executable of its own package. Cargo exposes those to the test as `CARGO_BIN_EXE_<name>`
    (Cargo reference, "Environment variables Cargo sets for `cargo test`"). The test may spawn
@@ -287,7 +292,8 @@ changed input that the key does not cover. The known uncovered inputs are:
 | Binaries spawned by path | `spawns` | An unlisted helper binary changes |
 | Randomized tests (hegel, proptest, quickcheck) | Nothing: a pass is cached like any other | The cache makes them explore less. Every rebuild of the binary explores again; `--no-cache` explores again on demand |
 | Time, network, machine state | Nothing | Same as any test that depends on them |
-| Binaries relinked between hashing and the end of the run (sources edited before a via-cargo run, which rebuilds; another terminal's `cargo build`) | The executable and spawned binaries are hashed again after a pass, which is recorded only if every digest is unchanged | Nothing known. An input edited during the run is recorded with its old digest, so the next run reruns |
+| Binaries relinked between hashing and the end of the run (sources edited before a via-cargo run, which rebuilds; another terminal's `cargo build`) | The executable and spawned binaries are checked again after a pass, which is recorded only if every digest is unchanged. A file whose stat fields still match its remembered digest is not read again | Nothing known. An input edited during the run is recorded with its old digest, so the next run reruns |
+| A binary rewritten in place with the same size, modification time, change time, inode and device (remembered digests) | Size, nanosecond times, inode and device must all match; a digest is remembered only once the file's times are 2 s old; linkers write a new file and rename it (a new inode) | A filesystem whose clock runs more than 2 s behind this machine's (some network filesystems), or a tool that restores the modification time and is not seen in the change time. Use `--no-stat-cache` |
 | A different binary built for one target under `--via-cargo` (feature unification) | Before running one target through Cargo, its `--no-run` build must report the hashed executable, or the pass is not recorded | No wrong skip, but often no record: building `-p <pkg> --test <name>` alone unifies features differently (2 of this repository's 4 binaries differ), and those binaries rerun every time under per-target via-cargo. `[env]` and configured runners force the via-cargo runner, so this affects users who never pass `--via-cargo`. Follow-up: have the direct runner apply `[env]` itself, so that only runners force via-cargo |
 | Shared libraries in build-script link-search directories | Nothing: only executables are hashed | A rebuilt `.so`/`.dylib` that a test loads at runtime, with an unchanged test executable |
 | Cargo configuration (`.cargo/config.toml`, `--config`, and the files their `include` names, followed recursively; a missing optional include is keyed as absent) | Keyed coarsely: a digest of every config file and `--config` value | Configuration from environment variables (`CARGO_*`), which is not keyed. `[env]` and target runners, which the direct runner cannot apply, make the run go through Cargo |

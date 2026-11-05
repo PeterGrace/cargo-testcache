@@ -39,7 +39,7 @@ more than 1,000 files is warned about. The README covers both the glob advice an
 - `just gate`: formatting, clippy with `-D warnings`, dylint, every test (84 unit, 14 fixture,
   2 binary, doctests), the Hegel canary and docs. All pass.
 - Manual: in a copy of the fixture workspace, adding `BRAND_NEW_VAR` (unset) to `env` and
-  running `--explain` printed `env BRAND_NEW_VAR newly declared, unset` for all four binaries.
+  running `--explain` printed `env BRAND_NEW_VAR newly declared, unset` for all six binaries.
 
 ## Decisions
 

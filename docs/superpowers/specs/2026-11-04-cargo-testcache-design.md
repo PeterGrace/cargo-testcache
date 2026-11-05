@@ -263,7 +263,8 @@ cargo testcache clear
 - `--via-cargo`: section 4.4's fallback runner.
 - `--no-doc`: skip doc tests.
 - `status`: builds as `run` does, and lists what would run and what would be skipped, without
-  running anything.
+  running anything. It records no passes, but it does save the digests it computed to
+  `hashes.json` (key part 1), so the next run need not hash those files again.
 
 The output ends with a line such as:
 

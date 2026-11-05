@@ -25,6 +25,14 @@ A test filter spelled exactly `status` or `clear` must be written after `--`
 | `--via-cargo` | Run each binary through `cargo test -p <pkg> --test <name>` instead of directly |
 | `--no-doc` | Skip doc tests (they are never cached) |
 
+On a first, cold run, pass `--no-fail-fast`. Like `cargo test`, a run stops at the first
+binary that fails, so the binaries after it are neither run nor recorded; with
+`--no-fail-fast` every passing binary is recorded, so the next run does not repeat them.
+
+After a variable is added to `env`, the next run explains `env X newly declared, unset` (or
+`env X newly keyed, set`): the binaries run because the key now includes the variable, not
+because the environment changed.
+
 `--via-cargo` often cannot record a pass. When only some binaries must run, it builds each
 target alone (`-p <pkg> --test <name>`), and Cargo then unifies features differently, so it
 often builds a different executable from the one that was hashed (2 of this repository's 4 test
@@ -38,6 +46,11 @@ about. Put a file that only some checkouts have (a developer's `.env` read by an
 in `optional_inputs` instead: it is keyed on the same way, so its appearing or disappearing
 reruns the binaries that declare it, but matching nothing is expected and not warned about. A
 glob listed in both keys counts as required, so it is still warned about.
+
+Every matched file is hashed on every run, so keep globs narrow. Name source directories one
+level deep (`sidecar/src/**`, not `sidecar/**`) and leave dependency directories such as
+`node_modules` out, declaring their lockfile instead: it changes whenever they do. A glob that
+matches more than 1,000 files is warned about, with its count.
 
 ```toml
 [workspace.metadata.testcache]
@@ -73,8 +86,10 @@ spawns = ["helper-server"]
 - A `targets.<name>` that names none of the package's lib, bin, test, bench or example
   targets, and is not `lib` for a package with a library, is an error, as is `targets` in
   `[workspace.metadata.testcache]`. Only workspace members are checked.
-- `--explain` says which level declares a changed input:
-  ``input migrations/1.sql changed (target `migrate`)``.
+- `--explain` says which levels declare a changed input, and which target a target table's
+  spawned binary belongs to:
+  ``input migrations/1.sql changed (target `migrate`)``,
+  ``spawned binary helper-server changed (target `lib`)``.
 
 Any change to a `.cargo/config.toml` (in the working directory, its ancestors or `$CARGO_HOME`),
 to a file it `include`s, or to a `--config` argument reruns every binary. When the

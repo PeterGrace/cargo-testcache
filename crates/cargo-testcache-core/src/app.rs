@@ -751,7 +751,7 @@ fn explain(reason: &RunReason, binary: &TargetId, inputs: &InputIndex) -> String
         Change::Tool
         | Change::Binary
         | Change::Spawned(_)
-        | Change::Env(_)
+        | Change::Env { .. }
         | Change::Args
         | Change::CargoConfig => None,
     })

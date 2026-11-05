@@ -5,7 +5,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::discover::TargetId;
-use crate::key::{KeyParts, PartResult};
+use crate::key::{Digest, KeyParts, PartResult};
 use crate::store::PassRecord;
 
 /// What forces a binary to run whatever its key.
@@ -51,16 +51,85 @@ pub enum Change {
     Tool,
     /// The test executable.
     Binary,
-    /// A spawned binary, by its name in the key.
+    /// A spawned binary, by its name in the key ([`KeyParts::spawned`]).
     Spawned(String),
     /// An input file, by its workspace-relative path.
     Input(String),
-    /// An environment variable.
-    Env(String),
+    /// An environment variable, and how its entry in the key differs.
+    Env {
+        /// The variable's name.
+        name: String,
+        /// How it differs.
+        change: EnvChange,
+    },
     /// The arguments after `--`.
     Args,
     /// Cargo's configuration files or `--config` values.
     CargoConfig,
+}
+
+/// How a variable's entry in the key differs from the recorded pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnvChange {
+    /// Keyed both times, with a different value (or set one time and unset the other).
+    Value,
+    /// Not keyed before: newly declared, or a `RUST_TEST_TIME_*` variable newly set. `set` is
+    /// whether it is set now, so an unset one is not mistaken for a change to the environment.
+    Added {
+        /// Whether the variable is set now.
+        set: bool,
+    },
+    /// Keyed before, not now.
+    Removed,
+}
+
+impl EnvChange {
+    /// How a variable's entry differs between two keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `old` - Its entry in the recorded key, if it had one: `Some(None)` is keyed but unset.
+    /// * `new` - Its entry in the current key, likewise.
+    ///
+    /// # Returns
+    ///
+    /// The difference, or `None` when the entries are equal.
+    pub fn between(old: Option<&Option<Digest>>, new: Option<&Option<Digest>>) -> Option<Self> {
+        match (old, new) {
+            (None, None) => None,
+            (None, Some(value)) => Some(Self::Added {
+                set: value.is_some(),
+            }),
+            (Some(_), None) => Some(Self::Removed),
+            (Some(old), Some(new)) => (old != new).then_some(Self::Value),
+        }
+    }
+}
+
+/// A spawned binary's key name ([`KeyParts::spawned`]) split into the binary and the target
+/// whose `targets.<name>` table declares it, if one does.
+///
+/// # Arguments
+///
+/// * `name` - `bin <name>`, `spawns <path>` or `target <target> spawns <path>`.
+///
+/// # Returns
+///
+/// `(x, None)` for `bin x` and `spawns x`, `(x, Some(t))` for `target t spawns x`, and any
+/// other name whole, with no target.
+fn spawned_parts(name: &str) -> (&str, Option<&str>) {
+    // Cargo target names hold no spaces, so the first ` spawns ` ends the target's name.
+    if let Some((target, path)) = name
+        .strip_prefix("target ")
+        .and_then(|rest| rest.split_once(" spawns "))
+    {
+        return (path, Some(target));
+    }
+    let binary = name
+        .strip_prefix("bin ")
+        .or_else(|| name.strip_prefix("spawns "))
+        .unwrap_or(name);
+    (binary, None)
 }
 
 /// The summary line's groups of run reasons.
@@ -117,9 +186,25 @@ impl fmt::Display for Change {
         match self {
             Self::Tool => formatter.write_str("cargo-testcache changed"),
             Self::Binary => formatter.write_str("binary changed"),
-            Self::Spawned(name) => write!(formatter, "spawned {name} changed"),
+            // A target's spawn names its target the way an input names its declaring table.
+            Self::Spawned(name) => match spawned_parts(name) {
+                (binary, Some(target)) => {
+                    write!(
+                        formatter,
+                        "spawned binary {binary} changed (target `{target}`)"
+                    )
+                }
+                (binary, None) => write!(formatter, "spawned binary {binary} changed"),
+            },
             Self::Input(path) => write!(formatter, "input {path} changed"),
-            Self::Env(name) => write!(formatter, "env {name} changed"),
+            Self::Env { name, change } => match change {
+                EnvChange::Value => write!(formatter, "env {name} changed"),
+                EnvChange::Added { set: true } => write!(formatter, "env {name} newly keyed, set"),
+                EnvChange::Added { set: false } => {
+                    write!(formatter, "env {name} newly declared, unset")
+                }
+                EnvChange::Removed => write!(formatter, "env {name} no longer keyed"),
+            },
             Self::Args => formatter.write_str("arguments changed"),
             Self::CargoConfig => formatter.write_str("cargo configuration changed"),
         }
@@ -239,7 +324,10 @@ pub fn changes(old: &KeyParts, new: &KeyParts) -> Vec<Change> {
     }
     changes.extend(changed_names(&old.spawned, &new.spawned).map(Change::Spawned));
     changes.extend(changed_names(&old.inputs, &new.inputs).map(Change::Input));
-    changes.extend(changed_names(&old.env, &new.env).map(Change::Env));
+    changes.extend(changed_names(&old.env, &new.env).filter_map(|name| {
+        let change = EnvChange::between(old.env.get(&name), new.env.get(&name))?;
+        Some(Change::Env { name, change })
+    }));
     if old.args != new.args {
         changes.push(Change::Args);
     }
@@ -305,7 +393,6 @@ mod tests {
     use hegel::generators as gs;
 
     use crate::discover::TargetKind;
-    use crate::key::Digest;
     use crate::key::testing::{PART_COUNT, draw_parts, mutate_one_part};
 
     fn target() -> TargetId {
@@ -321,14 +408,19 @@ mod tests {
             .expect("a pass is recorded")
     }
 
-    /// The one change `mutate_one_part` makes for `which` (below `PART_COUNT`), named `name`.
-    fn expected_change(which: u8, name: &str) -> Change {
+    /// The one change `mutate_one_part` makes for `which` (below `PART_COUNT`), named `name`,
+    /// going from `old` to `new` (one of which it mutated).
+    fn expected_change(which: u8, name: &str, old: &KeyParts, new: &KeyParts) -> Change {
         match which {
             0 => Change::Tool,
             1 => Change::Binary,
             2 => Change::Spawned(name.to_owned()),
             3 => Change::Input(name.to_owned()),
-            4 => Change::Env(name.to_owned()),
+            4 => Change::Env {
+                name: name.to_owned(),
+                change: EnvChange::between(old.env.get(name), new.env.get(name))
+                    .expect("mutate_one_part changes the entry"),
+            },
             5 => Change::Args,
             _ => Change::CargoConfig,
         }
@@ -351,6 +443,11 @@ mod tests {
                 Some(record_of(changed))
             }
         };
+        // Only history 2 records changed parts: they are the old ones, the drawn parts the new.
+        let expected_change = previous
+            .as_ref()
+            .filter(|_| history == 2)
+            .map(|record| expected_change(which, &name, &record.parts, &parts));
 
         let decision = decide(&Ok(parts), previous.as_ref(), Policy::default());
 
@@ -358,7 +455,7 @@ mod tests {
             (0, Decision::Run(RunReason::NeverPassed)) => {}
             (1, Decision::Skip { passed_at }) => assert_eq!(passed_at, 7),
             (2, Decision::Run(RunReason::Changed(changes))) => {
-                assert_eq!(changes, [expected_change(which, &name)]);
+                assert_eq!(Some(changes), expected_change.map(|change| vec![change]));
             }
             (history, decision) => panic!("history {history} gave {decision:?}"),
         }
@@ -381,6 +478,11 @@ mod tests {
                 Some(record_of(changed))
             }
         };
+        // Only history 2 records changed parts: they are the old ones, the drawn parts the new.
+        let expected_change = previous
+            .as_ref()
+            .filter(|_| history == 2)
+            .map(|record| expected_change(which, &name, &record.parts, &parts));
         let no_cache = tc.draw(gs::booleans());
         let always_run = tc.draw(gs::booleans());
         let known = tc.draw(gs::booleans());
@@ -409,7 +511,7 @@ mod tests {
             match history {
                 0 => Decision::Run(RunReason::NeverPassed),
                 1 => Decision::Skip { passed_at: 7 },
-                _ => Decision::Run(RunReason::Changed(vec![expected_change(which, &name)])),
+                _ => Decision::Run(RunReason::Changed(expected_change.into_iter().collect())),
             }
         };
         assert_eq!(decision, expected);
@@ -442,7 +544,10 @@ mod tests {
         let mut new = old.clone();
         mutate_one_part(&mut new, which, name.clone());
 
-        assert_eq!(changes(&old, &new), [expected_change(which, &name)]);
+        assert_eq!(
+            changes(&old, &new),
+            [expected_change(which, &name, &old, &new)]
+        );
         assert_eq!(
             Change::Input(name.clone()).to_string(),
             format!("input {name} changed")
@@ -451,6 +556,60 @@ mod tests {
             Change::CargoConfig.to_string(),
             "cargo configuration changed"
         );
+    }
+
+    // Property: a variable's entry differs exactly when the two entries are unequal, and the
+    // explanation says whether the key gained, lost or changed it. One unset both times but
+    // newly declared reads as declared, not as a change to the environment.
+    #[hegel::test]
+    fn env_changes_say_how_the_entry_differs(tc: TestCase) {
+        let draw_entry = || {
+            tc.draw(gs::optional(gs::optional(gs::booleans())))
+                .map(|value| value.map(|byte| Digest::of_bytes(&[u8::from(byte)])))
+        };
+        let old = draw_entry();
+        let new = draw_entry();
+        let name = tc.draw(gs::text().alphabet("ABC_").min_size(1).max_size(4));
+
+        let change = EnvChange::between(old.as_ref(), new.as_ref());
+
+        assert_eq!(change.is_none(), old == new);
+        let Some(change) = change else { return };
+        let text = Change::Env {
+            name: name.clone(),
+            change,
+        }
+        .to_string();
+        let expected = match (old, new) {
+            (None, Some(None)) => format!("env {name} newly declared, unset"),
+            (None, Some(Some(_))) => format!("env {name} newly keyed, set"),
+            (Some(_), None) => format!("env {name} no longer keyed"),
+            (Some(_), Some(_)) => format!("env {name} changed"),
+            (None, None) => unreachable!("equal entries are no change"),
+        };
+        assert_eq!(text, expected);
+    }
+
+    // Property: a spawned binary is explained by its own name, never by its key prefix, and a
+    // target-level one names its target the way an input names its declaring table.
+    #[hegel::test]
+    fn spawned_binaries_are_explained_by_name(tc: TestCase) {
+        let binary = tc.draw(gs::text().alphabet("ab/ .").min_size(1).max_size(6));
+        let target = tc.draw(gs::text().alphabet("tu_-").min_size(1).max_size(4));
+        let level = tc.draw(gs::integers::<u8>().max_value(2));
+        let name = match level {
+            0 => format!("bin {binary}"),
+            1 => format!("spawns {binary}"),
+            _ => format!("target {target} spawns {binary}"),
+        };
+
+        let text = Change::Spawned(name).to_string();
+
+        let expected = match level {
+            0 | 1 => format!("spawned binary {binary} changed"),
+            _ => format!("spawned binary {binary} changed (target `{target}`)"),
+        };
+        assert_eq!(text, expected);
     }
 
     // Property: removing one input is reported as that input changing, and nothing else.

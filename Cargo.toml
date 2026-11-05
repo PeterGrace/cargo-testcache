@@ -81,8 +81,9 @@ unwrap_used = "warn"
 lto = true
 codegen-units = 1
 
-# Lint libraries `just dylint` runs. Bump a tag here and the matching `cargo-dylint` version
-# together: a library is compiled against a driver, and a mismatched pair fails to load.
+# Lint libraries `just dylint` runs. Each is compiled against the driver `cargo-dylint` builds;
+# CI installs cargo-dylint 6.3.0 (see ci.yml), which loads these v6.0.4 libraries. When bumping
+# a tag, check `just dylint` still loads every library before changing CI.
 [workspace.metadata.dylint]
 libraries = [
     { git = "https://github.com/trailofbits/dylint", tag = "v6.0.4", pattern = "examples/supplementary" },

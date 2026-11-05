@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 // taking the name `Digest`, which this module uses for its own type.
 use sha2::{Digest as _, Sha256};
 
-/// Bumped whenever [`KeyParts::key`] changes how it encodes the parts, so a key computed one
-/// way is never compared with one computed another way.
-pub const KEY_FORMAT_VERSION: u32 = 2;
+/// Bumped whenever [`KeyParts::key`] changes how it encodes the parts, or how a part's entries
+/// are named, so a key computed one way is never compared with one computed another way.
+/// Version 3 names target-level spawns `target <name> spawns <path>`.
+pub const KEY_FORMAT_VERSION: u32 = 3;
 
 /// Environment variables that are part of every key, besides those the configuration names.
 pub const ALWAYS_KEYED_ENV: [&str; 2] = ["RUST_TEST_THREADS", "RUST_MIN_STACK"];
@@ -137,7 +138,8 @@ pub struct KeyParts {
     /// The test executable (part 1).
     pub binary: Digest,
     /// Binaries the test may spawn: `bin <name>` for `CARGO_BIN_EXE_<name>`, `spawns <path>` for
-    /// the configured `spawns` (part 2).
+    /// the workspace's and package's `spawns`, and `target <name> spawns <path>` for a
+    /// `targets.<name>` table's (part 2).
     pub spawned: BTreeMap<String, Digest>,
     /// Declared input files, by workspace-relative path (part 3).
     pub inputs: BTreeMap<String, Digest>,

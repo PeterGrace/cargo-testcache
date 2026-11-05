@@ -27,6 +27,13 @@ pub enum Error {
         value: String,
     },
 
+    /// An on/off setting other than `1`, `0`, `true` or `false`.
+    #[error("invalid switch {value:?}, expected 1, 0, true or false")]
+    InvalidSwitch {
+        /// The value that was given.
+        value: String,
+    },
+
     /// A filesystem or process operation failed.
     #[error("{action}: {source}")]
     Io {

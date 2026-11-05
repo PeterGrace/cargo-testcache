@@ -13,7 +13,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
+use cargo_testcache_core::config::FULL_HASH_VAR;
+use cargo_testcache_core::hashes::RACY_WINDOW;
 use cargo_testcache_core::inputs::LARGE_GLOB_FILES;
 use hegel::TestCase;
 use hegel::generators::{self as gs, Generator};
@@ -752,6 +755,75 @@ fn no_cache_runs_everything(tc: TestCase) {
         fixture.testcache_ok(&[]);
         assert_eq!(fixture.take_runs(), BTreeSet::new(), "after {args:?}");
     }
+}
+
+/// Replaces the remembered digest of the `gamma` test executable in the fixture's
+/// `hashes.json` with `digest`, which must be the only entry for it.
+fn plant_gamma_digest(fixture: &Fixture, digest: &str) {
+    let path = fixture.temp.path().join("target/testcache/hashes.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read hashes.json")).expect("JSON");
+    let gamma: Vec<&mut serde_json::Value> = stored["entries"]
+        .as_array_mut()
+        .expect("an entries array")
+        .iter_mut()
+        .filter(|entry| {
+            Path::new(entry["path"].as_str().expect("a path"))
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("gamma-"))
+        })
+        .collect();
+    assert_eq!(gamma.len(), 1, "one remembered gamma executable");
+    for entry in gamma {
+        entry["digest"] = serde_json::Value::from(digest);
+    }
+    fs::write(&path, stored.to_string()).expect("write hashes.json");
+}
+
+// Property (issue #9): once a binary's times have settled, its remembered digest is used in
+// place of hashing it while its metadata is unchanged, so a planted digest makes it run; and
+// `--no-stat-cache` or `CARGO_TESTCACHE_FULL_HASH=1` hashes in full, ignoring the planted
+// digest. The opt-out is drawn.
+#[hegel::test(test_cases = 2)]
+fn remembered_digests_replace_hashing_unless_turned_off(tc: TestCase) {
+    let by_flag = tc.draw(gs::booleans());
+    let planted = "00".repeat(32);
+    let fixture = Fixture::new();
+    fixture.testcache_ok(&[]);
+    fixture.take_runs();
+    // The executables were linked just now, inside the racy window, so the first run cannot
+    // remember them; a run after the window has passed does.
+    std::thread::sleep(RACY_WINDOW + Duration::from_secs(1));
+    fixture.testcache_ok(&[]);
+    assert_eq!(fixture.take_runs(), BTreeSet::new(), "warm run");
+
+    plant_gamma_digest(&fixture, &planted);
+    let full_hash = if by_flag {
+        fixture.testcache(&["--no-stat-cache"], &[])
+    } else {
+        fixture.testcache(&[], &[(FULL_HASH_VAR, OsStr::new("1"))])
+    };
+    assert!(full_hash.status.success(), "{}", stderr(&full_hash));
+    assert_eq!(
+        fixture.take_runs(),
+        BTreeSet::new(),
+        "full hash, by flag: {by_flag}"
+    );
+
+    plant_gamma_digest(&fixture, &planted);
+    let reused = fixture.testcache_ok(&["--explain"]);
+    assert_eq!(
+        fixture.take_runs(),
+        names(&["gamma"]),
+        "{}",
+        stderr(&reused)
+    );
+    assert!(
+        stderr(&reused).contains("binary changed"),
+        "{}",
+        stderr(&reused)
+    );
 }
 
 // Property (9.8): `status` runs nothing and records nothing, and `clear` forgets every pass.

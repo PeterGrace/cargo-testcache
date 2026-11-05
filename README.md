@@ -24,6 +24,7 @@ A test filter spelled exactly `status` or `clear` must be written after `--`
 | `--explain` | Print why each binary runs: binary, input `x` or env `Y` changed, ... |
 | `--via-cargo` | Run each binary through `cargo test -p <pkg> --test <name>` instead of directly |
 | `--no-doc` | Skip doc tests (they are never cached) |
+| `--no-stat-cache` | Hash every executable in full (also `CARGO_TESTCACHE_FULL_HASH=1`) |
 
 On a first, cold run, pass `--no-fail-fast`. Like `cargo test`, a run stops at the first
 binary that fails, so the binaries after it are neither run nor recorded; with
@@ -98,6 +99,15 @@ only Cargo applies them. That is the via-cargo runner, with the limit above: you
 passing `--via-cargo`, and binaries that Cargo builds differently on their own are never
 recorded. Applying `[env]` in the direct runner, so that only runners need Cargo, is future
 work.
+
+Hashing large test executables reads a lot of disk, so each executable's digest is remembered in
+`<target-dir>/testcache/hashes.json` with its size, modification and change times, inode and
+device, and reused while they are unchanged: a warm run reads only file metadata. A file
+modified within 2 seconds of being checked is hashed again on the next run (git's "racy" rule),
+so a binary is first remembered when it is checked at least 2 seconds after it was linked. The
+remaining risk is a file rewritten in place with every one of those fields unchanged, or a
+network filesystem whose clock lags by more than 2 seconds; `--no-stat-cache` hashes everything
+in full.
 
 The record lives in `<target-dir>/testcache/passes.jsonl`; `cargo clean` removes it too. Keep a
 plain `cargo test` in CI: the cache is for local iteration.

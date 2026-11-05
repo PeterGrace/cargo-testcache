@@ -53,6 +53,10 @@ struct Cli {
     /// Skip doc tests.
     #[arg(long, global = true)]
     no_doc: bool,
+    /// Hash every test executable in full, instead of reusing digests remembered for files
+    /// whose size, times and inode are unchanged [env: CARGO_TESTCACHE_FULL_HASH=1].
+    #[arg(long, global = true)]
+    no_stat_cache: bool,
     /// Log format, `text` or `json` [env: CARGO_TESTCACHE_LOG_FORMAT].
     #[arg(long, global = true)]
     log_format: Option<LogFormat>,
@@ -79,9 +83,16 @@ fn main() -> ExitCode {
     // `--help`, `--version` and usage errors print and exit here.
     let cli = Cli::parse_from(std::iter::once(OsString::from("cargo-testcache")).chain(own));
     let (config, dotenv_warnings) = load_config();
-    let config = config.map(|config| match cli.log_format {
-        Some(log_format) => config.with_log_format(log_format),
-        None => config,
+    let config = config.map(|config| {
+        let config = match cli.log_format {
+            Some(log_format) => config.with_log_format(log_format),
+            None => config,
+        };
+        if cli.no_stat_cache {
+            config.with_full_hash()
+        } else {
+            config
+        }
     });
     telemetry::init(
         config
@@ -97,7 +108,7 @@ fn main() -> ExitCode {
 
     let outcome = config
         .context("loading configuration")
-        .and_then(|_| dispatch(&cli, cargo, test));
+        .and_then(|config| dispatch(&cli, &config, cargo, test));
     match outcome {
         Ok(Outcome::Passed) => ExitCode::SUCCESS,
         Ok(Outcome::TestsFailed) => ExitCode::from(TEST_FAILURE_EXIT),
@@ -196,12 +207,18 @@ fn load_config() -> (cargo_testcache_core::Result<Config>, Vec<String>) {
     (config, warnings)
 }
 
-/// Runs what the command line asked for.
+/// Runs what the command line asked for, with the configuration from the environment and the
+/// command line.
 ///
 /// # Errors
 ///
 /// Whatever the run or the clear fails with, with context.
-fn dispatch(cli: &Cli, cargo_args: CargoArgs, test_args: Vec<OsString>) -> anyhow::Result<Outcome> {
+fn dispatch(
+    cli: &Cli,
+    config: &Config,
+    cargo_args: CargoArgs,
+    test_args: Vec<OsString>,
+) -> anyhow::Result<Outcome> {
     let status_only = match cli.mode {
         Some(Mode::Clear) => {
             let removed = app::clear(&cargo_args).context("clearing the recorded passes")?;
@@ -217,6 +234,7 @@ fn dispatch(cli: &Cli, cargo_args: CargoArgs, test_args: Vec<OsString>) -> anyho
         explain: cli.explain,
         via_cargo: cli.via_cargo,
         no_doc: cli.no_doc,
+        full_hash: config.full_hash(),
         cargo_args,
         test_args,
     };
@@ -234,7 +252,13 @@ mod tests {
     // rest goes to cargo, and clap then parses what was recognized.
     #[hegel::test]
     fn own_options_are_recognized_among_cargo_arguments(tc: TestCase) {
-        let flags = ["--no-cache", "--explain", "--via-cargo", "--no-doc"];
+        let flags = [
+            "--no-cache",
+            "--explain",
+            "--via-cargo",
+            "--no-doc",
+            "--no-stat-cache",
+        ];
         let cargo = ["-p", "alpha", "--release"];
         let status = tc.draw(gs::booleans());
         let json = tc.draw(gs::booleans());
@@ -285,6 +309,7 @@ mod tests {
         assert_eq!(cli.explain, has("--explain"));
         assert_eq!(cli.via_cargo, has("--via-cargo"));
         assert_eq!(cli.no_doc, has("--no-doc"));
+        assert_eq!(cli.no_stat_cache, has("--no-stat-cache"));
         assert_eq!(cli.log_format.is_some(), json);
         assert_eq!(matches!(cli.mode, Some(Mode::Status)), status);
     }

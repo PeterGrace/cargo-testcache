@@ -36,7 +36,8 @@ with `inputs` relative to the package. Globs must stay inside the workspace root
 in a package is fine, an absolute glob is refused, and a glob that matches no file is warned
 about. Put a file that only some checkouts have (a developer's `.env` read by an opt-in test)
 in `optional_inputs` instead: it is keyed on the same way, so its appearing or disappearing
-reruns the binaries that declare it, but matching nothing is expected and not warned about.
+reruns the binaries that declare it, but matching nothing is expected and not warned about. A
+glob listed in both keys counts as required, so it is still warned about.
 
 ```toml
 [workspace.metadata.testcache]

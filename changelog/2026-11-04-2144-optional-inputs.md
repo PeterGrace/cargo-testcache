@@ -18,7 +18,8 @@ warned about.
   and `PackageGlobs::globs`. Each compiled glob records a `Declared` with whether it is
   optional, and `warn_unmatched` skips optional globs via the new `unmatched`. A target table
   with only optional globs now counts as declaring inputs.
-- `README.md`: documents `optional_inputs` at each level.
+- `README.md`: documents `optional_inputs` at each level, and that a glob listed in both
+  `inputs` and `optional_inputs` counts as required and is still warned about (from review).
 - Tests: `only_required_globs_that_match_nothing_are_warned_about` (inputs unit property); the
   manifest properties cover the new key at both table kinds; the fixture test
   `package_inputs_may_climb_out_of_the_package` now checks an unmatched optional glob is silent

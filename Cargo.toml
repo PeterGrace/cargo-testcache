@@ -10,7 +10,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Minimum supported Rust version, checked by `just msrv`. `std::fs::File::lock` (the store's
 # lock) needs 1.89.

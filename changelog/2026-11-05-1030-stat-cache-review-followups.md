@@ -22,8 +22,10 @@ digested in each run is declined; Decisions explains why.
 
 ## Tests
 
-- `just fmt`, `cargo clippy --workspace --all-targets -- -D warnings` and `just test` were run;
-  the PR for this change gives the results.
+- `just fmt`: no changes. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `just test`: all passed (2 + 15 fixture + 90 core + 2 doc tests), the two now-`cfg(unix)`
+  properties among them on Linux.
+- `just dylint` (including `hyp_hegel`): clean.
 
 ## Decisions
 

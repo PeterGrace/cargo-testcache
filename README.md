@@ -48,8 +48,8 @@ spawns = ["myapp-server"]                        # binaries spawned by path, und
 ```
 
 A package can narrow `inputs`, `optional_inputs` and `spawns` to some of its test targets, so a
-fixture one test reads, or a helper only some tests spawn, reruns only those binaries. A binary's key covers the
-workspace's and its package's declarations plus its own target's:
+fixture one test reads, or a helper only some tests spawn, reruns only those binaries. A binary's
+key covers the workspace's and its package's declarations plus its own target's:
 
 ```toml
 [package.metadata.testcache]

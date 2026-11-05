@@ -14,8 +14,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::args::CargoArgs;
+use crate::discover::TargetKind;
 use crate::error::{Error, Result};
-use crate::manifest::{AlwaysRun, TestcacheConfig};
+use crate::manifest::{AlwaysRun, TestcacheConfig, target_matches};
 
 /// The directory under the target directory that holds the store.
 pub const STORE_DIR: &str = "testcache";
@@ -55,6 +56,57 @@ struct RawPackage {
     manifest_path: PathBuf,
     /// `[package.metadata]`.
     metadata: Option<Value>,
+    /// Its targets, which `targets.<name>` tables must name.
+    #[serde(default)]
+    targets: Vec<RawTarget>,
+}
+
+/// One target of a package in `cargo metadata`'s output.
+#[derive(Debug, Deserialize)]
+struct RawTarget {
+    name: String,
+    /// Cargo's kinds, such as `["lib"]`, `["proc-macro"]`, `["test"]` or `["custom-build"]`.
+    kind: Vec<String>,
+}
+
+/// Refuses a member's `targets.<name>` table that names none of its test targets, as a
+/// misspelt key is refused.
+///
+/// # Arguments
+///
+/// * `package` - The package, with its targets.
+/// * `config` - Its `[package.metadata.testcache]` table.
+/// * `location` - The table, for the message.
+///
+/// # Errors
+///
+/// [`Error::InvalidManifest`] for the first key that is neither the name of a lib, bin,
+/// test, bench or example target of the package, nor `lib` for a package with a library.
+fn check_target_names(
+    package: &RawPackage,
+    config: &TestcacheConfig,
+    location: &str,
+) -> Result<()> {
+    // Build scripts (`custom-build`) have no kind here, since they have no test binary.
+    let kinds = || {
+        package
+            .targets
+            .iter()
+            .filter_map(|target| Some((TargetKind::from_cargo(&target.kind)?, &target.name)))
+    };
+    let names = |key: &str| kinds().any(|(kind, name)| target_matches(key, kind, name));
+    let Some(unknown) = config.targets.keys().find(|key| !names(key)) else {
+        return Ok(());
+    };
+    let known: Vec<&str> = kinds().map(|(_, name)| name.as_str()).collect();
+    Err(Error::InvalidManifest {
+        location: location.to_owned(),
+        message: format!(
+            "`targets.{unknown}` names no test target of the package (its targets: {}; `lib` \
+             names its library, if it has one)",
+            known.join(", ")
+        ),
+    })
 }
 
 /// A package: where it lives, its test environment and its configuration table.
@@ -197,14 +249,17 @@ impl Workspace {
             what: "cargo metadata output".to_owned(),
             source,
         })?;
-        let config = TestcacheConfig::from_metadata(raw.metadata.as_ref(), "[workspace.metadata]")?;
+        let config = TestcacheConfig::from_workspace_metadata(raw.metadata.as_ref())?;
         let packages = raw
             .packages
             .into_iter()
             .map(|package| {
                 let config = if raw.workspace_members.contains(&package.id) {
                     let location = format!("package `{}`", package.name);
-                    TestcacheConfig::from_metadata(package.metadata.as_ref(), &location)?
+                    let config =
+                        TestcacheConfig::from_metadata(package.metadata.as_ref(), &location)?;
+                    check_target_names(&package, &config, &location)?;
+                    config
                 } else {
                     TestcacheConfig::default()
                 };
@@ -465,7 +520,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use hegel::TestCase;
-    use hegel::generators as gs;
+    use hegel::generators::{self as gs, Generator};
 
     fn env_value<'a>(package: &'a Package, name: &str) -> &'a OsStr {
         package
@@ -594,6 +649,114 @@ mod tests {
             let dependency = workspace.package(DEPENDENCY_ID).expect("listed");
             assert_eq!(dependency.config(), &TestcacheConfig::default());
             assert_eq!(dependency.name(), "dep");
+        }
+    }
+    /// [`metadata`] with package `a` given these `(kind, name)` targets and a testcache table
+    /// with one `targets.<key>` table, listed as a workspace member only when `member` is true.
+    fn metadata_with_targets(targets: &[(&str, &str)], key: &str, member: bool) -> Vec<u8> {
+        let mut value: Value =
+            serde_json::from_slice(&metadata("0.1.0", None)).expect("the fixture is JSON");
+        let package = &mut value["packages"][0];
+        package["targets"] = targets
+            .iter()
+            .map(|(kind, name)| serde_json::json!({ "name": name, "kind": [kind] }))
+            .collect();
+        package["metadata"]["testcache"]["targets"] =
+            serde_json::json!({ key: { "inputs": ["x/**"] } });
+        if !member {
+            value["workspace_members"] = serde_json::json!([]);
+        }
+        value.to_string().into_bytes()
+    }
+
+    /// Draws a few `(kind, name)` targets with names over `ab`, so `lib` and the `xy` names
+    /// drawn below are never among them.
+    fn draw_targets(tc: &TestCase) -> Vec<(&'static str, String)> {
+        tc.draw(
+            gs::vecs(gs::tuples!(
+                gs::sampled_from(&["bin", "test", "bench", "example"]).print_as_debug(),
+                gs::text().alphabet("ab").min_size(1).max_size(3)
+            ))
+            .min_size(1)
+            .max_size(4),
+        )
+    }
+
+    // Property: a member's `targets.<key>` must name one of its targets; a name that matches
+    // none is refused, naming the package's table, and any of its target names is accepted.
+    #[hegel::test]
+    fn a_target_name_that_matches_nothing_is_refused(tc: TestCase) {
+        let targets = draw_targets(&tc);
+        let index = tc.draw(gs::integers::<usize>().max_value(targets.len() - 1));
+        let unknown = tc.draw(gs::text().alphabet("xy").min_size(1).max_size(3));
+        let listed: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|(kind, name)| (*kind, name.as_str()))
+            .collect();
+
+        let known = Workspace::from_json(&metadata_with_targets(&listed, &targets[index].1, true));
+        let refused = Workspace::from_json(&metadata_with_targets(&listed, &unknown, true));
+
+        let workspace = known.expect("a target's own name is accepted");
+        let package = workspace.package(ID).expect("listed");
+        assert!(package.config().targets.contains_key(&targets[index].1));
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::InvalidManifest { location, message })
+                    if location == "package `a`" && message.contains(&unknown)
+            ),
+            "{refused:?}"
+        );
+    }
+
+    // Property: `lib` is accepted for a package with a library, whatever its library kind,
+    // and refused for one without, as is the name of its build script, which has no tests.
+    #[hegel::test]
+    fn lib_names_the_library_only_when_there_is_one(tc: TestCase) {
+        let mut targets = draw_targets(&tc);
+        let library = tc.draw(gs::optional(
+            gs::sampled_from(&["lib", "proc-macro", "rlib", "cdylib"]).print_as_debug(),
+        ));
+        if let Some(kind) = library {
+            targets.push((kind, "a".to_owned()));
+        }
+        targets.push(("custom-build", "build-script-build".to_owned()));
+        let listed: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|(kind, name)| (*kind, name.as_str()))
+            .collect();
+
+        let lib = Workspace::from_json(&metadata_with_targets(&listed, "lib", true));
+        let build_script =
+            Workspace::from_json(&metadata_with_targets(&listed, "build-script-build", true));
+
+        assert_eq!(lib.is_ok(), library.is_some(), "{library:?}: {lib:?}");
+        assert!(
+            matches!(&build_script, Err(Error::InvalidManifest { .. })),
+            "{build_script:?}"
+        );
+    }
+
+    // Property: a dependency's target tables are not checked, as its table is not read, while
+    // the same table on a member naming no target is refused.
+    #[hegel::test]
+    fn dependencies_target_tables_are_not_checked(tc: TestCase) {
+        let member = tc.draw(gs::booleans());
+        let unknown = tc.draw(gs::text().alphabet("xy").min_size(1).max_size(3));
+
+        let loaded =
+            Workspace::from_json(&metadata_with_targets(&[("test", "t")], &unknown, member));
+
+        if member {
+            assert!(
+                matches!(loaded, Err(Error::InvalidManifest { .. })),
+                "{loaded:?}"
+            );
+        } else {
+            let workspace = loaded.expect("a dependency's table is ignored");
+            let package = workspace.package(ID).expect("listed");
+            assert_eq!(package.config(), &TestcacheConfig::default());
         }
     }
 }

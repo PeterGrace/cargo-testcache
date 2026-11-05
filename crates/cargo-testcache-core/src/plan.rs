@@ -133,12 +133,42 @@ impl fmt::Display for RunReason {
             Self::AlwaysRun => formatter.write_str("matches always_run"),
             Self::Unavailable(why) => write!(formatter, "key unavailable: {why}"),
             Self::NeverPassed => formatter.write_str("never passed"),
-            Self::Changed(changes) => {
-                let changes: Vec<String> = changes.iter().map(ToString::to_string).collect();
-                formatter.write_str(&changes.join("; "))
+            Self::Changed(changes) => formatter.write_str(&join_changes(changes, |_| None)),
+        }
+    }
+}
+
+impl RunReason {
+    /// The reason as [`Display`](fmt::Display) words it, with a note added after any change
+    /// the caller knows more about (such as which table declares a changed input).
+    ///
+    /// # Arguments
+    ///
+    /// * `note` - The note for a change, or `None` to leave it as it is.
+    ///
+    /// # Returns
+    ///
+    /// The text: a noted change reads `input x changed (note)`.
+    pub fn describe(&self, note: impl Fn(&Change) -> Option<String>) -> String {
+        match self {
+            Self::Changed(changes) => join_changes(changes, note),
+            Self::NoCache | Self::AlwaysRun | Self::Unavailable(_) | Self::NeverPassed => {
+                self.to_string()
             }
         }
     }
+}
+
+/// The changes, each with its note if it has one, separated by `; `.
+fn join_changes(changes: &[Change], note: impl Fn(&Change) -> Option<String>) -> String {
+    changes
+        .iter()
+        .map(|change| match note(change) {
+            Some(note) => format!("{change} ({note})"),
+            None => change.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Decides whether a binary runs.
@@ -473,5 +503,31 @@ mod tests {
             pass_record(&target(), parts, true, Duration::MAX, 1).expect("a pass is recorded");
 
         assert_eq!(record.duration_ms, u64::MAX);
+    }
+
+    // Property: describing a reason adds each note after its own change and nothing else, and
+    // without notes it reads as the reason's Display.
+    #[hegel::test]
+    fn describe_adds_notes_to_the_changes_they_belong_to(tc: TestCase) {
+        let names = tc.draw(gs::vecs(gs::text().alphabet("ab").max_size(4)).max_size(4));
+        let note = tc.draw(gs::text().alphabet("xyz ").min_size(1).max_size(6));
+        let mut changes: Vec<Change> = names.iter().cloned().map(Change::Input).collect();
+        changes.push(Change::Binary);
+        let reason = RunReason::Changed(changes);
+        let noted = |change: &Change| matches!(change, Change::Input(_)).then(|| note.clone());
+
+        let described = reason.describe(noted);
+
+        let mut expected: Vec<String> = names
+            .iter()
+            .map(|name| format!("input {name} changed ({note})"))
+            .collect();
+        expected.push("binary changed".to_owned());
+        assert_eq!(described, expected.join("; "));
+        assert_eq!(reason.describe(|_| None), reason.to_string());
+        assert_eq!(
+            RunReason::NeverPassed.describe(noted),
+            RunReason::NeverPassed.to_string()
+        );
     }
 }

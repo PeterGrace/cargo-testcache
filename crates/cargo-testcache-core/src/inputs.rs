@@ -1,12 +1,15 @@
 //! Files tests read at runtime: matched by the configured `inputs` globs, and hashed.
 //!
 //! The workspace is walked once. Each file is matched against one compiled set holding the
-//! workspace's globs (relative to its root) and every package's (relative to that package's
-//! directory, rewritten to be relative to the root), and the matching files are hashed in
-//! parallel. The target and build directories and `.git` are not walked, nor is any directory
-//! that no glob's literal prefix leads to. Symlinked files and directories are followed, as a
-//! test reading them would follow them; directories are compared to the target and build
-//! directories by canonical path, because Cargo does not normalize the paths it reports.
+//! workspace's globs (relative to its root) and every package's and package target's (relative
+//! to that package's directory, rewritten to be relative to the root), and the matching files
+//! are hashed in parallel. A test binary's inputs are then the files of the globs that apply to
+//! it: the workspace's, its package's, and those of its package's `targets.<name>` tables that
+//! name its target. The target and build directories and `.git` are not walked, nor is any
+//! directory that no glob's literal prefix leads to. Symlinked files and directories are
+//! followed, as a test reading them would follow them; directories are compared to the target
+//! and build directories by canonical path, because Cargo does not normalize the paths it
+//! reports.
 //!
 //! Before compiling, each glob's literal directories (those before its first wildcard) are
 //! normalized: `.` is dropped and `..` resolved against the declaring package's directory, so
@@ -15,6 +18,7 @@
 //! can ever match a walked file. A glob that matches no file is warned about once per run.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobSet, GlobSetBuilder};
@@ -22,16 +26,42 @@ use globset::{GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
+use crate::discover::TargetId;
 use crate::error::{Error, Result};
 use crate::key::{Digest, PartResult};
-use crate::manifest::glob;
+use crate::manifest::{TargetConfig, glob, target_matches};
 use crate::workspace::Workspace;
 
-/// Who declared a glob: the workspace, or the package at this index.
+/// Who declared a glob: the workspace, the package at this index, or the package target at
+/// this index of [`InputPatterns`]'s `targets` (which holds its package index and name; an
+/// index keeps `Owner` small and `Copy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Owner {
     Workspace,
     Package(usize),
+    Target(usize),
+}
+
+/// The table that declares an input, as `--explain` names it.
+// `<'a>`: the names are borrowed from the [`InputIndex`] they came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputLevel<'a> {
+    /// `[workspace.metadata.testcache]`.
+    Workspace,
+    /// `[package.metadata.testcache]` of the package with this name.
+    Package(&'a str),
+    /// `[package.metadata.testcache.targets.<name>]`, with this name.
+    Target(&'a str),
+}
+
+impl fmt::Display for InputLevel<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workspace => formatter.write_str("workspace"),
+            Self::Package(name) => write!(formatter, "package `{name}`"),
+            Self::Target(name) => write!(formatter, "target `{name}`"),
+        }
+    }
 }
 
 /// Why a glob is refused when it reaches outside the workspace.
@@ -56,6 +86,8 @@ pub struct PackageGlobs<'a> {
     pub dir: Option<String>,
     /// Its globs, relative to its directory.
     pub globs: &'a [String],
+    /// Its `targets.<name>` tables, whose `inputs` are relative to its directory too.
+    pub targets: &'a BTreeMap<String, TargetConfig>,
 }
 
 /// Every `inputs` glob, compiled into one set.
@@ -66,7 +98,11 @@ pub struct InputPatterns {
     owners: Vec<Owner>,
     /// Package id to its `Owner::Package` index.
     package_index: HashMap<String, usize>,
-    /// Packages that declare inputs but lie outside the workspace root.
+    /// Each package's name, by its `Owner::Package` index.
+    package_names: Vec<String>,
+    /// By `Owner::Target` index: the target's package index and its `targets` key.
+    targets: Vec<(usize, String)>,
+    /// Packages that declare inputs, at either level, but lie outside the workspace root.
     outside: HashSet<String>,
     /// For each glob, the directory components before its first wildcard. An empty prefix means
     /// the glob can match anywhere.
@@ -99,6 +135,7 @@ impl InputPatterns {
                 .ok()
                 .map(slash_path),
             globs: &package.config().inputs,
+            targets: &package.config().targets,
         });
         Self::from_parts(&workspace.config().inputs, packages)
     }
@@ -108,7 +145,7 @@ impl InputPatterns {
     /// # Arguments
     ///
     /// * `workspace_globs` - Globs relative to the workspace root.
-    /// * `packages` - Each package's globs and directory.
+    /// * `packages` - Each package's globs (its own and its targets') and directory.
     ///
     /// # Returns
     ///
@@ -125,6 +162,8 @@ impl InputPatterns {
         let mut builder = GlobSetBuilder::new();
         let mut owners = Vec::new();
         let mut package_index = HashMap::new();
+        let mut package_names = Vec::new();
+        let mut targets = Vec::new();
         let mut outside = HashSet::new();
         let mut prefixes = Vec::new();
         let mut declared = Vec::new();
@@ -147,7 +186,12 @@ impl InputPatterns {
             )?;
         }
         for (index, package) in packages.into_iter().enumerate() {
-            if package.globs.is_empty() {
+            package_names.push(package.name.to_owned());
+            let target_globs = package
+                .targets
+                .iter()
+                .filter(|(_, target)| !target.inputs.is_empty());
+            if package.globs.is_empty() && target_globs.clone().next().is_none() {
                 continue;
             }
             package_index.insert(package.id.to_owned(), index);
@@ -161,6 +205,14 @@ impl InputPatterns {
             for pattern in package.globs {
                 add(&dir_components, pattern, Owner::Package(index), &table)?;
             }
+            for (name, target) in target_globs {
+                let owner = Owner::Target(targets.len());
+                targets.push((index, name.clone()));
+                let table = format!("package `{}` target `{name}`", package.name);
+                for pattern in &target.inputs {
+                    add(&dir_components, pattern, owner, &table)?;
+                }
+            }
         }
         let set = builder.build().map_err(|source| Error::InvalidGlob {
             pattern: "inputs".to_owned(),
@@ -170,6 +222,8 @@ impl InputPatterns {
             set,
             owners,
             package_index,
+            package_names,
+            targets,
             outside,
             prefixes,
             declared,
@@ -210,6 +264,43 @@ impl InputPatterns {
         owners.sort_unstable();
         owners.dedup();
         owners
+    }
+
+    /// Which owners' globs apply to a test binary: the workspace's, its package's, and its
+    /// package's targets' whose `targets` key names the binary's target.
+    ///
+    /// # Arguments
+    ///
+    /// * `binary` - The binary's target.
+    ///
+    /// # Returns
+    ///
+    /// A predicate on owners. It borrows `self` and `binary`, so `'a` bounds its life.
+    fn applies_to<'a>(&'a self, binary: &'a TargetId) -> impl Fn(Owner) -> bool + 'a {
+        let package = self.package_index.get(&binary.package_id).copied();
+        // `move` makes the closure own `package` (a copy), as it outlives this function.
+        move |owner| match owner {
+            Owner::Workspace => true,
+            Owner::Package(index) => Some(index) == package,
+            Owner::Target(target) => self.targets.get(target).is_some_and(|(index, key)| {
+                Some(*index) == package && target_matches(key, binary.kind, &binary.name)
+            }),
+        }
+    }
+
+    /// The table an owner stands for, as `--explain` names it.
+    fn level(&self, owner: Owner) -> InputLevel<'_> {
+        // The indices come from `from_parts`, so the lookups always succeed; an empty name
+        // only keeps this total.
+        match owner {
+            Owner::Workspace => InputLevel::Workspace,
+            Owner::Package(index) => {
+                InputLevel::Package(self.package_names.get(index).map_or("", String::as_str))
+            }
+            Owner::Target(target) => {
+                InputLevel::Target(self.targets.get(target).map_or("", |(_, key)| key.as_str()))
+            }
+        }
     }
 
     /// Warns once for each glob that matched no file.
@@ -363,37 +454,54 @@ impl InputIndex {
         Ok(Self { patterns, files })
     }
 
-    /// A package's inputs: the files the workspace's globs or its own match.
+    /// A test binary's inputs: the files the workspace's globs, its package's, or its target's
+    /// match. A file several of them match appears once.
     ///
     /// # Arguments
     ///
-    /// * `package_id` - The package. An id that is not known gets only the workspace's inputs.
+    /// * `binary` - The binary's target. A package that is not known gets only the
+    ///   workspace's inputs.
     ///
     /// # Returns
     ///
     /// Workspace-relative path to digest, or why the inputs cannot be known (an unreadable
-    /// file, or a package outside the workspace root that declares inputs).
-    pub fn for_package(&self, package_id: &str) -> PartResult<BTreeMap<String, Digest>> {
-        if self.patterns.outside.contains(package_id) {
+    /// file, or a package outside the workspace root that declares inputs at either level).
+    pub fn for_binary(&self, binary: &TargetId) -> PartResult<BTreeMap<String, Digest>> {
+        if self.patterns.outside.contains(&binary.package_id) {
             return Err("the package declares inputs but is outside the workspace root".to_owned());
         }
-        let own = self
-            .patterns
-            .package_index
-            .get(package_id)
-            .copied()
-            .map(Owner::Package);
+        let applies = self.patterns.applies_to(binary);
         self.files
             .iter()
-            .filter(|file| {
-                file.owners
-                    .iter()
-                    .any(|owner| *owner == Owner::Workspace || Some(*owner) == own)
-            })
+            .filter(|file| file.owners.iter().any(|owner| applies(*owner)))
             .map(|file| match &file.digest {
                 Ok(digest) => Ok((file.relative.clone(), *digest)),
                 Err(error) => Err(format!("cannot read input {}: {error}", file.relative)),
             })
+            .collect()
+    }
+
+    /// The tables whose globs, as configured now, put a path in a test binary's inputs.
+    ///
+    /// The path is matched against the globs rather than looked up among the files, so a
+    /// removed file's levels are found too.
+    ///
+    /// # Arguments
+    ///
+    /// * `relative` - A workspace-relative path with `/` separators, as keys name inputs.
+    /// * `binary` - The binary's target.
+    ///
+    /// # Returns
+    ///
+    /// The declaring levels, workspace first, then package, then targets; empty when no glob
+    /// that applies to the binary matches the path.
+    pub fn declaring_levels(&self, relative: &str, binary: &TargetId) -> Vec<InputLevel<'_>> {
+        let applies = self.patterns.applies_to(binary);
+        self.patterns
+            .owners_of_globs(&self.patterns.set.matches(relative))
+            .into_iter()
+            .filter(|owner| applies(*owner))
+            .map(|owner| self.patterns.level(owner))
             .collect()
     }
 }
@@ -538,7 +646,25 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators::{self as gs, Generator};
 
+    use crate::discover::TargetKind;
     use crate::key::testing::draw_digest;
+
+    /// No `targets` tables. `BTreeMap::new` is a `const fn`, so it can initialize a `static`.
+    static NO_TARGETS: BTreeMap<String, TargetConfig> = BTreeMap::new();
+
+    /// The target of a test binary of a package.
+    fn binary(package: &str, kind: TargetKind, name: &str) -> TargetId {
+        TargetId {
+            package_id: package.to_owned(),
+            kind,
+            name: name.to_owned(),
+        }
+    }
+
+    /// A package's library test binary, named after the package.
+    fn lib_of(package: &str) -> TargetId {
+        binary(package, TargetKind::Lib, package)
+    }
 
     /// The workspace has `data/**`; packages a and b each have `fixtures/**` under their own
     /// directory (which may need escaping); package c is outside the workspace root.
@@ -564,24 +690,28 @@ mod tests {
                     name: "a",
                     dir: Some(a_dir.to_owned()),
                     globs: &fixtures,
+                    targets: &NO_TARGETS,
                 },
                 PackageGlobs {
                     id: "b",
                     name: "b",
                     dir: Some("crates/b".to_owned()),
                     globs: &fixtures,
+                    targets: &NO_TARGETS,
                 },
                 PackageGlobs {
                     id: "c",
                     name: "c",
                     dir: None,
                     globs: &fixtures,
+                    targets: &NO_TARGETS,
                 },
                 PackageGlobs {
                     id: "d",
                     name: "d",
                     dir: Some("crates/d".to_owned()),
                     globs: &[],
+                    targets: &NO_TARGETS,
                 },
             ],
         )
@@ -662,8 +792,10 @@ mod tests {
         ];
         let index = InputIndex { patterns, files };
 
-        let for_a = index.for_package("a");
-        let for_b = index.for_package("b").expect("b's inputs are readable");
+        let for_a = index.for_binary(&lib_of("a"));
+        let for_b = index
+            .for_binary(&lib_of("b"))
+            .expect("b's inputs are readable");
 
         if a_readable {
             let expected = BTreeMap::from([
@@ -682,8 +814,11 @@ mod tests {
             for_b.keys().collect::<Vec<_>>(),
             ["crates/b/fixtures/z", "data/x"]
         );
-        assert!(index.for_package("c").is_err());
-        assert_eq!(index.for_package("d").map(|inputs| inputs.len()), Ok(1));
+        assert!(index.for_binary(&lib_of("c")).is_err());
+        assert_eq!(
+            index.for_binary(&lib_of("d")).map(|inputs| inputs.len()),
+            Ok(1)
+        );
     }
 
     // Property: every directory on the way to a matched file could contain matches, and a
@@ -829,6 +964,7 @@ mod tests {
                 name: "a",
                 dir: Some(dir.join("/")),
                 globs: &globs,
+                targets: &NO_TARGETS,
             }],
         )
         .expect("valid globs");
@@ -860,6 +996,7 @@ mod tests {
                 name: "a",
                 dir: Some("crates/a".to_owned()),
                 globs: package_globs,
+                targets: &NO_TARGETS,
             }],
         );
 
@@ -868,5 +1005,183 @@ mod tests {
             Err(Error::InvalidGlob { pattern: at, reason: why }) if *at == pattern && why == reason
         );
         assert!(refused, "{compiled:?}");
+    }
+    /// The workspace has `data/**` and `**/shared.txt`. Package a (at crates/a) has
+    /// `fixtures/**`, and targets `migrate` (`migrations/**`, `fixtures/*.sql`), `lib`
+    /// (`lib_only/**`) and `spawner` (no inputs). Package b (at crates/b) has only a target
+    /// `migrate` (`migrations/**`); package c, outside the root, has only a target `t`.
+    fn target_patterns() -> InputPatterns {
+        let table = |inputs: &[&str]| TargetConfig {
+            inputs: inputs.iter().map(|glob| (*glob).to_owned()).collect(),
+            spawns: Vec::new(),
+        };
+        let a_targets = BTreeMap::from([
+            (
+                "migrate".to_owned(),
+                table(&["migrations/**", "fixtures/*.sql"]),
+            ),
+            ("lib".to_owned(), table(&["lib_only/**"])),
+            ("spawner".to_owned(), table(&[])),
+        ]);
+        let b_targets = BTreeMap::from([("migrate".to_owned(), table(&["migrations/**"]))]);
+        let c_targets = BTreeMap::from([("t".to_owned(), table(&["x/**"]))]);
+        let fixtures = ["fixtures/**".to_owned()];
+        InputPatterns::from_parts(
+            &["data/**".to_owned(), "**/shared.txt".to_owned()],
+            [
+                PackageGlobs {
+                    id: "a",
+                    name: "a",
+                    dir: Some("crates/a".to_owned()),
+                    globs: &fixtures,
+                    targets: &a_targets,
+                },
+                PackageGlobs {
+                    id: "b",
+                    name: "b",
+                    dir: Some("crates/b".to_owned()),
+                    globs: &[],
+                    targets: &b_targets,
+                },
+                PackageGlobs {
+                    id: "c",
+                    name: "c",
+                    dir: None,
+                    globs: &[],
+                    targets: &c_targets,
+                },
+            ],
+        )
+        .expect("valid globs")
+    }
+
+    /// Draws a test binary of package a: its library, a target named `migrate` of any kind
+    /// that can share that name, or a target with no table of its own.
+    fn draw_a_binary(tc: &TestCase) -> TargetId {
+        let (kind, name) = tc.draw(
+            gs::sampled_from(&[
+                (TargetKind::Lib, "a"),
+                (TargetKind::Test, "migrate"),
+                (TargetKind::Bin, "migrate"),
+                (TargetKind::Bench, "migrate"),
+                (TargetKind::Example, "migrate"),
+                (TargetKind::Test, "other"),
+                (TargetKind::Example, "spawner"),
+            ])
+            .print_as_debug(),
+        );
+        binary("a", kind, name)
+    }
+
+    // Property: a target-level file is in the inputs of the binaries its table names, and
+    // only of those: `migrate` of every kind, and `lib` for the library. Workspace and package
+    // files are in every binary of the package; a file several levels match appears once;
+    // another package's target of the same name does not see this one's files.
+    #[hegel::test]
+    fn target_inputs_reach_only_their_targets_binaries(tc: TestCase) {
+        let patterns = target_patterns();
+        let target = draw_a_binary(&tc);
+        let other_kind = tc.draw(
+            gs::sampled_from(&[TargetKind::Lib, TargetKind::Test, TargetKind::Bin])
+                .print_as_debug(),
+        );
+        let paths = [
+            "data/x",
+            "crates/a/fixtures/y",
+            "crates/a/fixtures/m.sql",
+            "crates/a/migrations/1.sql",
+            "crates/a/lib_only/z",
+            "crates/b/migrations/2.sql",
+            "crates/b/fixtures/shared.txt",
+        ];
+        let files = paths
+            .iter()
+            .map(|relative| InputFile {
+                owners: patterns.owners_of(relative),
+                relative: (*relative).to_owned(),
+                digest: Ok(draw_digest(&tc)),
+            })
+            .collect();
+        let index = InputIndex { patterns, files };
+
+        let for_a = index.for_binary(&target).expect("a's inputs are readable");
+        let for_b = index
+            .for_binary(&binary("b", other_kind, "migrate"))
+            .expect("b's inputs are readable");
+
+        let mut expected_a = vec![
+            "crates/a/fixtures/m.sql",
+            "crates/a/fixtures/y",
+            "crates/b/fixtures/shared.txt",
+            "data/x",
+        ];
+        if target.name == "migrate" {
+            expected_a.push("crates/a/migrations/1.sql");
+        }
+        if target.kind == TargetKind::Lib {
+            expected_a.push("crates/a/lib_only/z");
+        }
+        expected_a.sort_unstable();
+        assert_eq!(for_a.keys().collect::<Vec<_>>(), expected_a, "{target:?}");
+        assert_eq!(
+            for_b.keys().collect::<Vec<_>>(),
+            [
+                "crates/b/fixtures/shared.txt",
+                "crates/b/migrations/2.sql",
+                "data/x"
+            ]
+        );
+        assert!(index.for_binary(&binary("c", other_kind, "t")).is_err());
+        assert!(index.patterns.declared.contains(&(
+            "migrations/**".to_owned(),
+            "package `a` target `migrate`".to_owned()
+        )));
+    }
+
+    // Property: the levels declaring a path for a binary are those whose globs match it now
+    // and apply to the binary, in workspace, package, target order, whether or not the file
+    // exists; a path only another binary's table declares has none.
+    #[hegel::test]
+    fn declaring_levels_name_the_tables_that_apply(tc: TestCase) {
+        let target = draw_a_binary(&tc);
+        let index = InputIndex {
+            patterns: target_patterns(),
+            files: Vec::new(),
+        };
+        let migrate = target.name == "migrate";
+        let lib = target.kind == TargetKind::Lib;
+        let only = |applies: bool, level: InputLevel<'static>| {
+            if applies { vec![level] } else { Vec::new() }
+        };
+        let mut sql = vec![InputLevel::Package("a")];
+        sql.extend(only(migrate, InputLevel::Target("migrate")));
+        let cases: [(&str, Vec<InputLevel<'_>>); 6] = [
+            ("data/x", vec![InputLevel::Workspace]),
+            (
+                "crates/a/fixtures/shared.txt",
+                vec![InputLevel::Workspace, InputLevel::Package("a")],
+            ),
+            ("crates/a/fixtures/m.sql", sql),
+            (
+                "crates/a/migrations/gone.sql",
+                only(migrate, InputLevel::Target("migrate")),
+            ),
+            ("crates/a/lib_only/z", only(lib, InputLevel::Target("lib"))),
+            ("crates/b/migrations/2.sql", Vec::new()),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(
+                index.declaring_levels(path, &target),
+                expected,
+                "{path} for {target:?}"
+            );
+        }
+        assert_eq!(
+            InputLevel::Target("migrate").to_string(),
+            "target `migrate`"
+        );
+        assert_eq!(InputLevel::Package("a").to_string(), "package `a`");
+        assert_eq!(InputLevel::Workspace.to_string(), "workspace");
     }
 }

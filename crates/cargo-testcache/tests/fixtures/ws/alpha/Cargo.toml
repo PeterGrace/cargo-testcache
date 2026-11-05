@@ -14,3 +14,8 @@ probe = { path = "../probe" }
 
 [package.metadata.testcache]
 inputs = ["fixtures/**"]
+
+# Only the integration test `tests/reads_input.rs` reads this file, so changing it reruns that
+# binary alone, not alpha's unit tests.
+[package.metadata.testcache.targets.reads_input]
+inputs = ["reads_input_data/**"]

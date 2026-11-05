@@ -91,9 +91,13 @@ prefixes:
 2. **Spawned binaries:** for an integration test or a benchmark, the hashes of every `bin`
    executable of its own package. Cargo exposes those to the test as `CARGO_BIN_EXE_<name>`
    (Cargo reference, "Environment variables Cargo sets for `cargo test`"). The test may spawn
-   them, and a change to one changes nothing in the test binary itself.
-3. **Declared inputs:** the contents of every file matched by the configured input globs
-   (section 5), sorted by path, path included.
+   them, and a change to one changes nothing in the test binary itself. Then the configured
+   `spawns` (section 5) that apply to the binary, each under a name that shows its level:
+   `spawns <path>` for the workspace's and its package's, `target <name> spawns <path>` for
+   its target's. Moving a declaration between levels changes the key.
+3. **Declared inputs:** the contents of every file matched by an input glob that applies to
+   the binary (the workspace's, its package's and its target's; section 5), sorted by path,
+   path included. A file several levels match is in the key once.
 4. **Declared environment:** the values (or "unset") of the configured environment variable
    names. A fixed set is always included: `RUST_TEST_THREADS`, `RUST_MIN_STACK` and
    `RUST_TEST_TIME_*`.
@@ -201,7 +205,43 @@ always_run = ["*/live_*"]
 spawns = ["myapp-server"]
 ```
 
-Package overrides use the same keys and add to the workspace's values.
+Package overrides use the same keys and add to the workspace's values. A package's `inputs`
+are relative to its directory.
+
+A package's table can also narrow `inputs` and `spawns` to some of its test targets, so that a
+fixture one test reads, or a helper only some tests spawn, reruns only those binaries:
+
+```toml
+[package.metadata.testcache]
+inputs = ["shared/**"]                 # every target of the package
+
+[package.metadata.testcache.targets.migrate]   # integration test `tests/migrate.rs`
+inputs = ["migrations/**"]
+
+[package.metadata.testcache.targets.lib]       # the lib's unit tests
+inputs = ["../../scripts/fixture.json"]
+spawns = ["helper-server"]
+```
+
+A binary's key covers the workspace's and its package's declarations, plus those of every
+`targets.<name>` table that applies to it:
+
+- **Matching.** `targets.<name>` applies to every test binary of the package whose target is
+  named `<name>`, whatever its kind: a bin and an integration test with the same name both
+  match. `lib` also matches the library's unit tests, whose target name is the crate name.
+- **Keys.** A target table holds only `inputs` and `spawns`. `env` and `always_run` stay
+  package-level, and any other key is an error.
+- **Paths.** A target's `inputs` are relative to the package directory and follow the same
+  rules as the package's (normalized, never absolute or outside the workspace, warned about
+  when they match nothing; the warning names ``package `p` target `t` ``). Its `spawns` are
+  relative to the target profile directory.
+- **Validation.** A `targets.<name>` that names no lib, bin, test, bench or example target of
+  the package, and is not `lib` for a package with a library, is an error, like a misspelt
+  key. Only workspace members are checked, since dependencies' tables are not read.
+  `targets` in `[workspace.metadata.testcache]` is an error.
+- **Explain.** A changed input is followed by the levels that declare it now, several
+  separated by commas: ``input migrations/1.sql changed (target `migrate`)``,
+  ``input shared/a changed (package `alpha`)`` or ``input data/x changed (workspace)``.
 
 ## 6. Command line
 
@@ -213,7 +253,8 @@ cargo testcache clear
 
 - `--no-cache`: run everything and record the passes (a full refresh).
 - `--explain`: print, for every binary, why it runs (never passed; binary changed; input
-  `migrations/0007.sql` changed; env `X` changed; arguments changed) or why it is skipped.
+  `migrations/0007.sql` changed (workspace); env `X` changed; arguments changed) or why it is
+  skipped. A changed input names the levels (workspace, package, target) that declare it.
 - `--via-cargo`: section 4.4's fallback runner.
 - `--no-doc`: skip doc tests.
 - `status`: builds as `run` does, and lists what would run and what would be skipped, without

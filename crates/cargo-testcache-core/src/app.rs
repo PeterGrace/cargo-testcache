@@ -10,12 +10,12 @@ use rayon::prelude::*;
 
 use crate::args::CargoArgs;
 use crate::cargo_config::CargoConfig;
-use crate::discover::{self, Build, TargetKind, TestBinary};
+use crate::discover::{self, Build, TargetId, TargetKind, TestBinary};
 use crate::error::{Error, Result};
 use crate::exec::{self, LIBRARY_PATH_VAR, RunContext, Toolchain};
-use crate::inputs::InputIndex;
+use crate::inputs::{InputIndex, InputLevel};
 use crate::key::{self, Digest, KeyParts, PartResult};
-use crate::plan::{self, Decision, Policy};
+use crate::plan::{self, Change, Decision, Policy, RunReason};
 use crate::report::{self, Progress, Tally};
 use crate::store::Store;
 use crate::workspace::{Package, Workspace};
@@ -171,6 +171,9 @@ struct Planned<'a> {
     /// recorded. Empty when they could not be known, and then `parts` is an error.
     spawned: Vec<(String, PathBuf)>,
     decision: Decision,
+    /// Why it runs, naming the tables that declare each changed input; `None` when it is
+    /// skipped. Worked out while planning, when the input index is at hand.
+    explanation: Option<String>,
 }
 
 /// What every step of a run shares.
@@ -244,8 +247,14 @@ impl Session<'_> {
                     no_cache: self.options.no_cache,
                     always_run: always_run.matches(package.name(), &binary.id.name),
                 };
+                let decision = plan::decide(&parts, store.lookup(&binary.id), policy);
+                let explanation = match &decision {
+                    Decision::Run(reason) => Some(explain(reason, &binary.id, &inputs)),
+                    Decision::Skip { .. } => None,
+                };
                 Planned {
-                    decision: plan::decide(&parts, store.lookup(&binary.id), policy),
+                    decision,
+                    explanation,
                     label: report::label(binary, package.name(), package.root()),
                     binary,
                     parts,
@@ -324,13 +333,13 @@ impl Session<'_> {
                 // `ref` borrows the reason instead of moving it out of `planned`, which
                 // `record_pass` takes whole once the reason is no longer used.
                 Decision::Run(ref reason) => {
-                    // `bool::then` gives `Some(closure())` when true, else `None`.
-                    let detail = options.explain.then(|| reason.to_string());
-                    progress.line(&report::status_line(
-                        "Running",
-                        &planned.label,
-                        detail.as_deref(),
-                    ));
+                    // `then_some` gives `Some(value)` when true, else `None`; `flatten` turns the
+                    // `Option<Option<&str>>` into an `Option<&str>`.
+                    let detail = options
+                        .explain
+                        .then_some(planned.explanation.as_deref())
+                        .flatten();
+                    progress.line(&report::status_line("Running", &planned.label, detail));
                     progress.set_message(format!("running {}", planned.label));
                     // The direct runner runs the hashed executable itself; through Cargo, the
                     // target alone may build a different one, whose pass the key cannot vouch for.
@@ -400,11 +409,10 @@ impl Session<'_> {
         let options = self.options;
         if options.explain {
             for planned in &planned {
-                if let Decision::Run(reason) = &planned.decision {
-                    let detail = reason.to_string();
+                if let Some(detail) = &planned.explanation {
                     eprintln!(
                         "{}",
-                        report::status_line("Running", &planned.label, Some(&detail))
+                        report::status_line("Running", &planned.label, Some(detail))
                     );
                 }
             }
@@ -574,10 +582,13 @@ fn report_status(planned: &[Planned<'_>]) -> Outcome {
                 tally.skipped();
             }
             Decision::Run(reason) => {
-                let detail = reason.to_string();
                 eprintln!(
                     "{}",
-                    report::status_line("Would run", &planned.label, Some(&detail))
+                    report::status_line(
+                        "Would run",
+                        &planned.label,
+                        planned.explanation.as_deref()
+                    )
                 );
                 tally.ran(reason.category(), true);
             }
@@ -619,7 +630,10 @@ fn ordered_binaries<'a>(
 }
 
 /// The binaries a test may spawn, by their name in the key: its package's bins for an
-/// integration test or benchmark, and the configured `spawns`.
+/// integration test or benchmark (`bin <name>`), the workspace's and package's `spawns`
+/// (`spawns <path>`), and those of the package's `targets.<name>` tables that name its target
+/// (`target <name> spawns <path>`). The name shows the level, so moving a declaration between
+/// levels changes the key.
 ///
 /// # Returns
 ///
@@ -639,9 +653,23 @@ fn spawned_paths(
                 .map(|(name, path)| (format!("bin {name}"), path.clone())),
         );
     }
+    // `move` lets the inner closure keep `key` after the outer one's call has returned.
+    let target_spawns = package
+        .config()
+        .targets_matching(binary.id.kind, &binary.id.name)
+        .flat_map(|(key, target)| {
+            target
+                .spawns
+                .iter()
+                .map(move |spawn| (format!("target {key} spawns {spawn}"), spawn.as_str()))
+        });
     // `peekable` lets the loop look at the next item without taking it, to see whether there
     // is any before working out the directory.
-    let mut spawns = workspace.spawns(package).peekable();
+    let mut spawns = workspace
+        .spawns(package)
+        .map(|spawn| (format!("spawns {spawn}"), spawn))
+        .chain(target_spawns)
+        .peekable();
     if spawns.peek().is_some() {
         let dir = workspace.artifact_dir(&binary.executable).ok_or_else(|| {
             format!(
@@ -649,7 +677,7 @@ fn spawned_paths(
                 binary.executable.display()
             )
         })?;
-        paths.extend(spawns.map(|spawn| (format!("spawns {spawn}"), dir.join(spawn))));
+        paths.extend(spawns.map(|(name, spawn)| (name, dir.join(spawn))));
     }
     Ok(paths)
 }
@@ -697,10 +725,46 @@ fn key_parts(
             .iter()
             .map(|(name, path)| Ok((name.clone(), digest(path)?)))
             .collect::<PartResult<_>>()?,
-        inputs: context.inputs.for_package(&binary.id.package_id)?,
+        inputs: context.inputs.for_binary(&binary.id)?,
         env: key::env_part(context.workspace.env_names(package), context.environment),
         args: context.args,
         cargo_config: context.cargo_config.clone()?,
+    })
+}
+
+/// Why a binary runs, as `--explain` and `status` print it: the reason, with each changed
+/// input followed by the tables that declare it now, such as
+/// `input data/x changed (package `alpha`)`.
+///
+/// # Arguments
+///
+/// * `reason` - Why it runs.
+/// * `binary` - Its target, which decides the tables that apply to it.
+/// * `inputs` - This run's inputs.
+///
+/// # Returns
+///
+/// The text. An input no table declares any longer gets no note.
+fn explain(reason: &RunReason, binary: &TargetId, inputs: &InputIndex) -> String {
+    reason.describe(|change| match change {
+        Change::Input(path) => levels_note(&inputs.declaring_levels(path, binary)),
+        Change::Tool
+        | Change::Binary
+        | Change::Spawned(_)
+        | Change::Env(_)
+        | Change::Args
+        | Change::CargoConfig => None,
+    })
+}
+
+/// The levels as a note: `workspace, package `a``, or `None` when there are none.
+fn levels_note(levels: &[InputLevel<'_>]) -> Option<String> {
+    (!levels.is_empty()).then(|| {
+        levels
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     })
 }
 
@@ -877,5 +941,124 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(order, expected);
+    }
+    /// [`metadata`] where the workspace spawns `ws-tool` and package a (with a lib `a` and an
+    /// integration test `reads`) has `fixtures/**` and spawns `pkg-tool`, its target `reads`
+    /// adds `fixtures/r/**` and spawns `helper`, and its target `lib` adds `lib/**`.
+    fn workspace_with_targets() -> Workspace {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&metadata("0.1.0", None)).expect("the fixture is JSON");
+        value["metadata"]["testcache"]["spawns"] = serde_json::json!(["ws-tool"]);
+        let package = &mut value["packages"][0];
+        package["targets"] = serde_json::json!([
+            { "name": "a", "kind": ["lib"] },
+            { "name": "reads", "kind": ["test"] },
+        ]);
+        package["metadata"]["testcache"] = serde_json::json!({
+            "inputs": ["fixtures/**"],
+            "spawns": ["pkg-tool"],
+            "targets": {
+                "reads": { "inputs": ["fixtures/r/**"], "spawns": ["helper"] },
+                "lib": { "inputs": ["lib/**"] },
+            },
+        });
+        Workspace::from_json(value.to_string().as_bytes()).expect("valid metadata")
+    }
+
+    /// Draws one of package a's binaries: its library, its test `reads`, or a test `other`
+    /// without a table of its own.
+    fn draw_binary(tc: &TestCase) -> TestBinary {
+        let (kind, name) = tc.draw(
+            gs::sampled_from(&[
+                (TargetKind::Lib, "a"),
+                (TargetKind::Test, "reads"),
+                (TargetKind::Test, "other"),
+            ])
+            .print_as_debug(),
+        );
+        TestBinary {
+            id: TargetId {
+                package_id: ID.to_owned(),
+                kind,
+                name: name.to_owned(),
+            },
+            src_path: PathBuf::from("/ws/crates/a/src/lib.rs"),
+            executable: PathBuf::from(format!("/ws/target/debug/deps/{name}-1")),
+        }
+    }
+
+    // Property: `--explain` follows a changed input with the levels that declare it for this
+    // binary now, and leaves an input no applicable table declares, and other changes, alone.
+    #[hegel::test]
+    fn explain_names_the_levels_that_declare_an_input(tc: TestCase) {
+        let workspace = workspace_with_targets();
+        // /ws does not exist, so the walk finds no file; levels come from the globs alone.
+        let inputs = InputIndex::collect(&workspace).expect("valid globs");
+        let binary = draw_binary(&tc);
+        let reads = binary.id.name == "reads";
+        let lib = binary.id.kind == TargetKind::Lib;
+        let fixture_levels = if reads {
+            " (package `a`, target `reads`)"
+        } else {
+            " (package `a`)"
+        };
+        let cases = [
+            ("data/x".to_owned(), " (workspace)".to_owned()),
+            (
+                "crates/a/fixtures/r/1".to_owned(),
+                fixture_levels.to_owned(),
+            ),
+            (
+                "crates/a/lib/2".to_owned(),
+                if lib { " (target `lib`)" } else { "" }.to_owned(),
+            ),
+            ("elsewhere/3".to_owned(), String::new()),
+        ];
+
+        for (path, note) in cases {
+            let reason = RunReason::Changed(vec![Change::Binary, Change::Input(path.clone())]);
+
+            let explained = explain(&reason, &binary.id, &inputs);
+
+            assert_eq!(
+                explained,
+                format!("binary changed; input {path} changed{note}"),
+                "{binary:?}"
+            );
+        }
+        assert_eq!(
+            explain(&RunReason::NeverPassed, &binary.id, &inputs),
+            "never passed"
+        );
+    }
+
+    // Property: a binary spawns the workspace's and package's `spawns` under `spawns <path>`,
+    // and its own targets' under `target <name> spawns <path>`, all under the profile directory.
+    #[hegel::test]
+    fn target_spawns_are_keyed_with_their_level(tc: TestCase) {
+        let workspace = workspace_with_targets();
+        let binary = draw_binary(&tc);
+        let package = workspace.package(ID).expect("listed");
+
+        let spawned =
+            spawned_paths(&workspace, &Build::default(), &binary, package).expect("known paths");
+
+        let mut expected = vec![
+            (
+                "spawns ws-tool".to_owned(),
+                PathBuf::from("/ws/target/debug/ws-tool"),
+            ),
+            (
+                "spawns pkg-tool".to_owned(),
+                PathBuf::from("/ws/target/debug/pkg-tool"),
+            ),
+        ];
+        if binary.id.name == "reads" {
+            expected.push((
+                "target reads spawns helper".to_owned(),
+                PathBuf::from("/ws/target/debug/helper"),
+            ));
+        }
+        assert_eq!(spawned, expected, "{binary:?}");
     }
 }

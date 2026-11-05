@@ -41,7 +41,7 @@ pub enum TargetKind {
 
 impl TargetKind {
     /// Reads Cargo's kind list (`["lib"]`, `["proc-macro"]`, `["test"]`).
-    fn from_cargo(kinds: &[String]) -> Option<Self> {
+    pub(crate) fn from_cargo(kinds: &[String]) -> Option<Self> {
         kinds.iter().find_map(|kind| match kind.as_str() {
             "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro" => Some(Self::Lib),
             "bin" => Some(Self::Bin),

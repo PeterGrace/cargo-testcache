@@ -560,6 +560,53 @@ fn package_inputs_may_climb_out_of_the_package(tc: TestCase) {
     );
 }
 
+// Property: a `[package.metadata.testcache.targets.<name>]` table narrows what it declares to
+// that target. alpha's `reads_input` table declares `reads_input_data/**` and, here, spawns
+// beta's `betatool`. Changing that input reruns `reads_input` alone, not alpha's unit tests;
+// changing `betatool` reruns `reads_input` too, besides beta's own binaries. `--explain` names
+// the level of each. Both changes are made in every case, in turn on one fixture, in a drawn
+// order.
+#[hegel::test(test_cases = 2)]
+fn target_tables_rerun_only_their_target(tc: TestCase) {
+    let reversed = tc.draw(gs::booleans());
+    let stamp = tc.draw(gs::integers::<u32>().min_value(1));
+    let fixture = Fixture::new();
+    // The target table is the last one in alpha's manifest, so this line joins it.
+    fixture.append("alpha/Cargo.toml", "spawns = [\"betatool\"]\n");
+    fixture.testcache_ok(&[]);
+    assert_eq!(fixture.take_runs(), names(&ALL), "the first run");
+    fixture.testcache_ok(&[]);
+    assert_eq!(fixture.take_runs(), BTreeSet::new(), "the second run");
+
+    let changes: [(&str, &[&str], &str); 2] = [
+        (
+            "alpha/reads_input_data/value.txt",
+            &["reads_input"],
+            "input alpha/reads_input_data/value.txt changed (target `reads_input`)",
+        ),
+        (
+            "beta/src/main.rs",
+            &["betatool", "reads_input", "spawns_tool"],
+            "spawned target reads_input spawns betatool changed",
+        ),
+    ];
+    for (file, expected, explained) in in_order(changes, reversed) {
+        if file.ends_with(".rs") {
+            fixture.set_stamp(file, stamp);
+        } else {
+            fixture.write(file, &stamp.to_string());
+        }
+        let output = fixture.testcache_ok(&["--explain"]);
+
+        assert_eq!(
+            fixture.take_runs(),
+            names(expected),
+            "after changing {file}"
+        );
+        assert!(stderr(&output).contains(explained), "{}", stderr(&output));
+    }
+}
+
 // Property (9.4): a failing binary is not recorded, so it runs again, and a passing one is, so
 // it does not. Every binary starts out failing and is fixed one at a time, in a drawn order:
 // each run then runs exactly the binaries that have not passed yet.

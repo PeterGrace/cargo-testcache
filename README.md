@@ -44,6 +44,34 @@ always_run = ["*/live_*"]                        # package/target patterns never
 spawns = ["myapp-server"]                        # binaries spawned by path, under target/<profile>
 ```
 
+A package can narrow `inputs` and `spawns` to some of its test targets, so a fixture one test
+reads, or a helper only some tests spawn, reruns only those binaries. A binary's key covers the
+workspace's and its package's declarations plus its own target's:
+
+```toml
+[package.metadata.testcache]
+inputs = ["shared/**"]                         # every target of the package
+
+[package.metadata.testcache.targets.migrate]   # integration test `tests/migrate.rs`
+inputs = ["migrations/**"]
+
+[package.metadata.testcache.targets.lib]       # the lib's unit tests
+inputs = ["../../scripts/fixture.json"]
+spawns = ["helper-server"]
+```
+
+- `targets.<name>` applies to every test binary of the package whose target is named `<name>`,
+  whatever its kind, so a bin and an integration test with the same name both match. `lib`
+  also matches the library's unit tests, whatever the crate is called.
+- A target table holds only `inputs` (relative to the package, under the same rules as the
+  package's) and `spawns` (under `target/<profile>`). `env` and `always_run` stay
+  package-level; any other key is an error.
+- A `targets.<name>` that names none of the package's lib, bin, test, bench or example
+  targets, and is not `lib` for a package with a library, is an error, as is `targets` in
+  `[workspace.metadata.testcache]`. Only workspace members are checked.
+- `--explain` says which level declares a changed input:
+  ``input migrations/1.sql changed (target `migrate`)``.
+
 Any change to a `.cargo/config.toml` (in the working directory, its ancestors or `$CARGO_HOME`),
 to a file it `include`s, or to a `--config` argument reruns every binary. When the
 configuration has an `[env]` table or a target runner, binaries run through `cargo test`, since

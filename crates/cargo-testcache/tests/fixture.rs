@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use cargo_testcache_core::inputs::LARGE_GLOB_FILES;
 use hegel::TestCase;
 use hegel::generators::{self as gs, Generator};
 use tempfile::TempDir;
@@ -278,7 +279,7 @@ fn changing_a_crate_reruns_only_its_dependents(tc: TestCase) {
         );
         if file.starts_with("beta") {
             assert!(
-                stderr(&output).contains("spawned bin betatool changed"),
+                stderr(&output).contains("spawned binary betatool changed"),
                 "{}",
                 stderr(&output)
             );
@@ -594,6 +595,40 @@ fn package_inputs_may_climb_out_of_the_package(tc: TestCase) {
     );
 }
 
+// Property: a glob that matches more than LARGE_GLOB_FILES files is warned about, naming the
+// glob, its table and the count; one that matches exactly that many is not. The workspace's
+// `data/**` covers the bulk files written here.
+#[hegel::test(test_cases = 2)]
+fn a_glob_matching_too_many_files_is_warned_about(tc: TestCase) {
+    let over = tc.draw(gs::booleans());
+    let fixture = Fixture::new();
+    // `data/value.txt` is already there, so this many more reach the limit, or pass it.
+    let bulk = LARGE_GLOB_FILES - 1 + usize::from(over);
+    fs::create_dir_all(fixture.root.join("data/bulk")).expect("create the bulk directory");
+    for index in 0..bulk {
+        fixture.write(&format!("data/bulk/{index}.txt"), &index.to_string());
+    }
+
+    let output = fixture.testcache_ok(&[]);
+
+    let warning = format!(
+        "inputs glob \"data/**\" in [workspace.metadata.testcache] matched {} files",
+        LARGE_GLOB_FILES + 1
+    );
+    assert_eq!(
+        stderr(&output).contains(&warning),
+        over,
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stderr(&output).contains("files, all hashed on every run"),
+        over,
+        "{}",
+        stderr(&output)
+    );
+}
+
 // Property: a `[package.metadata.testcache.targets.<name>]` table narrows what it declares to
 // that target. alpha's `reads_input` table declares `reads_input_data/**` and, here, spawns
 // beta's `betatool`. Changing that input reruns `reads_input` alone, not alpha's unit tests;
@@ -621,7 +656,7 @@ fn target_tables_rerun_only_their_target(tc: TestCase) {
         (
             "beta/src/main.rs",
             &["betatool", "reads_input", "spawns_tool"],
-            "spawned target reads_input spawns betatool changed",
+            "spawned binary betatool changed (target `reads_input`)",
         ),
     ];
     for (file, expected, explained) in in_order(changes, reversed) {

@@ -18,7 +18,9 @@
 //! can ever match a walked file. A glob that matches no file is warned about once per run,
 //! unless it is one of the `optional_inputs`, whose files may be absent. A missing optional
 //! file still changes the key the same way a missing required one does: the file is simply not
-//! among the binary's inputs, which a key records by name.
+//! among the binary's inputs, which a key records by name. A glob that matches more than
+//! [`LARGE_GLOB_FILES`] files is warned about too, since that is usually a `**` that reaches
+//! into a dependency directory such as `node_modules`, hashed on every run.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -34,6 +36,9 @@ use crate::error::{Error, Result};
 use crate::key::{Digest, PartResult};
 use crate::manifest::{TargetConfig, TestcacheConfig, glob, target_matches};
 use crate::workspace::Workspace;
+
+/// More files than this matched by one glob, required or optional, draw a warning.
+pub const LARGE_GLOB_FILES: usize = 1000;
 
 /// Who declared a glob: the workspace, the package at this index, or the package target at
 /// this index of [`InputPatterns`]'s `targets` (which holds its package index and name; an
@@ -373,27 +378,51 @@ impl InputPatterns {
     ///
     /// # Arguments
     ///
-    /// * `matched` - Whether each glob, by index, matched a file.
+    /// * `counts` - How many files each glob, by index, matched.
     ///
     /// # Returns
     ///
     /// The declarations to warn about, in declaration order; optional globs are never among them.
-    fn unmatched<'a>(&'a self, matched: &'a [bool]) -> impl Iterator<Item = &'a Declared> {
+    fn unmatched<'a>(&'a self, counts: &'a [usize]) -> impl Iterator<Item = &'a Declared> {
         self.declared
             .iter()
-            .zip(matched)
-            .filter(|(declared, matched)| !declared.optional && !**matched)
+            .zip(counts)
+            .filter(|(declared, count)| !declared.optional && **count == 0)
             .map(|(declared, _)| declared)
     }
 
-    /// Warns once for each required glob that matched no file.
+    /// The globs, required or optional, that matched more than [`LARGE_GLOB_FILES`] files.
     ///
     /// # Arguments
     ///
-    /// * `matched` - Whether each glob, by index, matched a file.
-    fn warn_unmatched(&self, matched: &[bool]) {
-        for Declared { pattern, table, .. } in self.unmatched(matched) {
+    /// * `counts` - How many files each glob, by index, matched.
+    ///
+    /// # Returns
+    ///
+    /// Each such declaration with its count, in declaration order.
+    fn oversized<'a>(&'a self, counts: &'a [usize]) -> impl Iterator<Item = (&'a Declared, usize)> {
+        self.declared
+            .iter()
+            .zip(counts.iter().copied())
+            .filter(|(_, count)| *count > LARGE_GLOB_FILES)
+    }
+
+    /// Warns once for each required glob that matched no file, and for each glob that matched
+    /// more than [`LARGE_GLOB_FILES`] files.
+    ///
+    /// # Arguments
+    ///
+    /// * `counts` - How many files each glob, by index, matched.
+    fn warn_about_counts(&self, counts: &[usize]) {
+        for Declared { pattern, table, .. } in self.unmatched(counts) {
             tracing::warn!("inputs glob {pattern:?} in {table} matched no file");
+        }
+        for (Declared { pattern, table, .. }, count) in self.oversized(counts) {
+            tracing::warn!(
+                "inputs glob {pattern:?} in {table} matched {count} files, all hashed on every \
+                 run; if it reaches into a dependency directory such as node_modules, name the \
+                 source directories instead and declare the lockfile"
+            );
         }
     }
 }
@@ -607,7 +636,7 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
 fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found> {
     let root = canonical_or_raw(workspace.root());
     let skipped = SkippedDirs::new([workspace.target_dir(), workspace.build_dir()]);
-    let mut matched = vec![false; patterns.owners.len()];
+    let mut counts = vec![0_usize; patterns.owners.len()];
     let found = WalkDir::new(&root)
         .follow_links(true)
         .into_iter()
@@ -643,7 +672,7 @@ fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found>
                 return None;
             }
             for index in &globs {
-                matched[*index] = true;
+                counts[*index] += 1;
             }
             let utf8 = relative_path.to_str().is_some();
             Some(Found {
@@ -654,7 +683,7 @@ fn matching_files(workspace: &Workspace, patterns: &InputPatterns) -> Vec<Found>
             })
         })
         .collect();
-    patterns.warn_unmatched(&matched);
+    patterns.warn_about_counts(&counts);
     found
 }
 
@@ -1227,9 +1256,11 @@ mod tests {
 
     // Property: of the globs that matched no file, exactly the required ones are warned about,
     // at every level and in declaration order; an optional glob is never warned about, and
-    // still owns the files it matches, so a present optional file is an input.
+    // still owns the files it matches, so a present optional file is an input. Every glob,
+    // optional or not, that matched more than LARGE_GLOB_FILES files is warned about with its
+    // count.
     #[hegel::test]
-    fn only_required_globs_that_match_nothing_are_warned_about(tc: TestCase) {
+    fn globs_matching_nothing_or_too_much_are_warned_about(tc: TestCase) {
         // Each table's globs are drawn as required or optional; each name is distinct, so a
         // glob matches only the file of its own name.
         let draw_split = |prefix: &str| {
@@ -1273,14 +1304,23 @@ mod tests {
             }],
         )
         .expect("valid globs");
-        let matched: Vec<bool> = declared_names
+        let counts: Vec<usize> = declared_names
             .iter()
-            .map(|_| tc.draw(gs::booleans()))
+            .map(|_| {
+                tc.draw(
+                    gs::sampled_from(&[0, 1, LARGE_GLOB_FILES, LARGE_GLOB_FILES + 1])
+                        .print_as_debug(),
+                )
+            })
             .collect();
 
         let warned: Vec<&str> = patterns
-            .unmatched(&matched)
+            .unmatched(&counts)
             .map(|declared| declared.pattern.as_str())
+            .collect();
+        let oversized: Vec<(&str, usize)> = patterns
+            .oversized(&counts)
+            .map(|(declared, count)| (declared.pattern.as_str(), count))
             .collect();
 
         let optional_names: Vec<&String> = [&workspace.1, &package.1, &target.1]
@@ -1289,11 +1329,18 @@ mod tests {
             .collect();
         let expected: Vec<&str> = declared_names
             .iter()
-            .zip(&matched)
-            .filter(|(name, matched)| !**matched && !optional_names.contains(name))
+            .zip(&counts)
+            .filter(|(name, count)| **count == 0 && !optional_names.contains(name))
             .map(|(name, _)| name.as_str())
             .collect();
-        assert_eq!(warned, expected, "matched {matched:?}");
+        assert_eq!(warned, expected, "counts {counts:?}");
+        let expected_oversized: Vec<(&str, usize)> = declared_names
+            .iter()
+            .zip(counts.iter().copied())
+            .filter(|(_, count)| *count > LARGE_GLOB_FILES)
+            .map(|(name, count)| (name.as_str(), count))
+            .collect();
+        assert_eq!(oversized, expected_oversized, "counts {counts:?}");
         for name in optional_names {
             assert!(
                 !patterns.owners_of(name).is_empty(),

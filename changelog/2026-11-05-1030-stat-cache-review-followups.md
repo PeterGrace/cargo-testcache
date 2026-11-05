@@ -16,7 +16,8 @@ digested in each run is declined; Decisions explains why.
 - `crates/cargo-testcache-core/src/hashes.rs`:
   `a_settled_digest_is_reused_while_the_metadata_matches` and
   `changed_metadata_or_no_reuse_hashes_again` are `#[cfg(unix)]`, because off Unix nothing is
-  remembered. The `expect` message now states its Unix assumption.
+  remembered. The `expect` message now states its Unix assumption. The tests' `draw_digest`
+  import, used only by those two, is `#[cfg(unix)]` as well (PR #11 review).
 - `crates/cargo-testcache/tests/fixture.rs`: the comment on the `status` property now says
   "records no passes" instead of "records nothing".
 
@@ -26,6 +27,9 @@ digested in each run is declined; Decisions explains why.
 - `just test`: all passed (2 + 15 fixture + 90 core + 2 doc tests), the two now-`cfg(unix)`
   properties among them on Linux.
 - `just dylint` (including `hyp_hegel`): clean.
+- `cargo clippy --target wasm32-unknown-unknown -p cargo-testcache-core --all-targets -- -D
+  warnings`, a non-Unix target: clean, where without the gated import it fails on `unused
+  import: crate::key::testing::draw_digest`.
 
 ## Decisions
 

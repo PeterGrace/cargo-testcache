@@ -308,6 +308,8 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
 
+    // Only the Unix-only tests below plant digests.
+    #[cfg(unix)]
     use crate::key::testing::draw_digest;
 
     /// Well after any file a test writes now: its times have settled by then.

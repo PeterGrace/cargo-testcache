@@ -34,18 +34,21 @@ direct runner.
 Declare what tests read at runtime in the root `Cargo.toml`; a package's own table adds to it,
 with `inputs` relative to the package. Globs must stay inside the workspace root: `../shared/**`
 in a package is fine, an absolute glob is refused, and a glob that matches no file is warned
-about.
+about. Put a file that only some checkouts have (a developer's `.env` read by an opt-in test)
+in `optional_inputs` instead: it is keyed on the same way, so its appearing or disappearing
+reruns the binaries that declare it, but matching nothing is expected and not warned about.
 
 ```toml
 [workspace.metadata.testcache]
 inputs = ["migrations/**", "tests/fixtures/**"]  # files read at runtime
+optional_inputs = [".env"]                       # the same, but they may be absent
 env = ["DATABASE_IMAGE"]                         # variables whose values matter
 always_run = ["*/live_*"]                        # package/target patterns never skipped
 spawns = ["myapp-server"]                        # binaries spawned by path, under target/<profile>
 ```
 
-A package can narrow `inputs` and `spawns` to some of its test targets, so a fixture one test
-reads, or a helper only some tests spawn, reruns only those binaries. A binary's key covers the
+A package can narrow `inputs`, `optional_inputs` and `spawns` to some of its test targets, so a
+fixture one test reads, or a helper only some tests spawn, reruns only those binaries. A binary's key covers the
 workspace's and its package's declarations plus its own target's:
 
 ```toml
@@ -63,9 +66,9 @@ spawns = ["helper-server"]
 - `targets.<name>` applies to every test binary of the package whose target is named `<name>`,
   whatever its kind, so a bin and an integration test with the same name both match. `lib`
   also matches the library's unit tests, whatever the crate is called.
-- A target table holds only `inputs` (relative to the package, under the same rules as the
-  package's) and `spawns` (under `target/<profile>`). `env` and `always_run` stay
-  package-level; any other key is an error.
+- A target table holds only `inputs` and `optional_inputs` (relative to the package, under the
+  same rules as the package's) and `spawns` (under `target/<profile>`). `env` and `always_run`
+  stay package-level; any other key is an error.
 - A `targets.<name>` that names none of the package's lib, bin, test, bench or example
   targets, and is not `lib` for a package with a library, is an error, as is `targets` in
   `[workspace.metadata.testcache]`. Only workspace members are checked.

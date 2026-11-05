@@ -15,7 +15,10 @@
 //! normalized: `.` is dropped and `..` resolved against the declaring package's directory, so
 //! `../shared/**` in `crates/a` becomes `crates/shared/**`. A glob that would climb above the
 //! workspace root, an absolute glob, and `..` after a wildcard are refused, since none of them
-//! can ever match a walked file. A glob that matches no file is warned about once per run.
+//! can ever match a walked file. A glob that matches no file is warned about once per run,
+//! unless it is one of the `optional_inputs`, whose files may be absent. A missing optional
+//! file still changes the key the same way a missing required one does: the file is simply not
+//! among the binary's inputs, which a key records by name.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -29,7 +32,7 @@ use walkdir::WalkDir;
 use crate::discover::TargetId;
 use crate::error::{Error, Result};
 use crate::key::{Digest, PartResult};
-use crate::manifest::{TargetConfig, glob, target_matches};
+use crate::manifest::{TargetConfig, TestcacheConfig, glob, target_matches};
 use crate::workspace::Workspace;
 
 /// Who declared a glob: the workspace, the package at this index, or the package target at
@@ -74,7 +77,64 @@ const PARENT_AFTER_WILDCARD: &str = "`..` is only resolved before the first wild
 /// Characters that make a glob component a pattern rather than a literal name.
 const WILDCARDS: [char; 5] = ['*', '?', '[', '{', '\\'];
 
-/// One package's `inputs`, for [`InputPatterns::from_parts`].
+/// One table's `inputs` and `optional_inputs`, for [`InputPatterns::from_parts`].
+// `Copy`: it only holds two borrowed slices, so copying it is as cheap as passing a reference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Globs<'a> {
+    /// Globs that are expected to match a file: one that matches none is warned about.
+    pub required: &'a [String],
+    /// Globs whose files may be absent: one that matches none is not warned about.
+    pub optional: &'a [String],
+}
+
+impl<'a> Globs<'a> {
+    /// Each glob with whether it is optional, required ones first.
+    fn iter(self) -> impl Iterator<Item = (&'a str, bool)> {
+        let required = self
+            .required
+            .iter()
+            .map(|pattern| (pattern.as_str(), false));
+        let optional = self.optional.iter().map(|pattern| (pattern.as_str(), true));
+        required.chain(optional)
+    }
+
+    /// Whether the table declares no glob at all.
+    fn is_empty(self) -> bool {
+        self.required.is_empty() && self.optional.is_empty()
+    }
+}
+
+// `From` lets a caller write `Globs::from(config)` or `config.into()`.
+impl<'a> From<&'a TestcacheConfig> for Globs<'a> {
+    fn from(config: &'a TestcacheConfig) -> Self {
+        Self {
+            required: &config.inputs,
+            optional: &config.optional_inputs,
+        }
+    }
+}
+
+impl<'a> From<&'a TargetConfig> for Globs<'a> {
+    fn from(config: &'a TargetConfig) -> Self {
+        Self {
+            required: &config.inputs,
+            optional: &config.optional_inputs,
+        }
+    }
+}
+
+/// A glob as declared, for the warning when it matches no file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Declared {
+    /// The glob as written.
+    pattern: String,
+    /// The table that declares it.
+    table: String,
+    /// Whether it is one of the `optional_inputs`, which are not warned about.
+    optional: bool,
+}
+
+/// One package's `inputs` and `optional_inputs`, for [`InputPatterns::from_parts`].
 #[derive(Debug, Clone)]
 pub struct PackageGlobs<'a> {
     /// The package id.
@@ -85,8 +145,8 @@ pub struct PackageGlobs<'a> {
     /// it is outside the root.
     pub dir: Option<String>,
     /// Its globs, relative to its directory.
-    pub globs: &'a [String],
-    /// Its `targets.<name>` tables, whose `inputs` are relative to its directory too.
+    pub globs: Globs<'a>,
+    /// Its `targets.<name>` tables, whose globs are relative to its directory too.
     pub targets: &'a BTreeMap<String, TargetConfig>,
 }
 
@@ -107,8 +167,9 @@ pub struct InputPatterns {
     /// For each glob, the directory components before its first wildcard. An empty prefix means
     /// the glob can match anywhere.
     prefixes: Vec<Vec<String>>,
-    /// For each glob, how it was written and the table that declares it, for messages.
-    declared: Vec<(String, String)>,
+    /// For each glob, how it was written, the table that declares it and whether it is
+    /// optional, for the warning about globs that match nothing.
+    declared: Vec<Declared>,
 }
 
 impl InputPatterns {
@@ -134,17 +195,17 @@ impl InputPatterns {
                 .strip_prefix(workspace.root())
                 .ok()
                 .map(slash_path),
-            globs: &package.config().inputs,
+            globs: package.config().into(),
             targets: &package.config().targets,
         });
-        Self::from_parts(&workspace.config().inputs, packages)
+        Self::from_parts(workspace.config().into(), packages)
     }
 
     /// Compiles globs given directly.
     ///
     /// # Arguments
     ///
-    /// * `workspace_globs` - Globs relative to the workspace root.
+    /// * `workspace_globs` - The workspace's globs, relative to the workspace root.
     /// * `packages` - Each package's globs (its own and its targets') and directory.
     ///
     /// # Returns
@@ -156,7 +217,7 @@ impl InputPatterns {
     /// [`Error::InvalidGlob`] when a glob does not compile, is absolute, climbs above the
     /// workspace root, or has `..` after a wildcard.
     pub fn from_parts<'a>(
-        workspace_globs: &[String],
+        workspace_globs: Globs<'_>,
         packages: impl IntoIterator<Item = PackageGlobs<'a>>,
     ) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
@@ -169,28 +230,32 @@ impl InputPatterns {
         let mut declared = Vec::new();
         // One closure adds a glob for either kind of table. It borrows the collections above
         // mutably until its last use, so they are moved into `Self` only after that.
-        let mut add = |dir: &[&str], pattern: &str, owner: Owner, table: &str| -> Result<()> {
-            let rooted = root_glob(dir, pattern)?;
-            builder.add(glob(&rooted.glob)?);
-            owners.push(owner);
-            prefixes.push(rooted.prefix);
-            declared.push((pattern.to_owned(), table.to_owned()));
+        let mut add = |dir: &[&str], globs: Globs<'_>, owner: Owner, table: &str| -> Result<()> {
+            for (pattern, optional) in globs.iter() {
+                let rooted = root_glob(dir, pattern)?;
+                builder.add(glob(&rooted.glob)?);
+                owners.push(owner);
+                prefixes.push(rooted.prefix);
+                declared.push(Declared {
+                    pattern: pattern.to_owned(),
+                    table: table.to_owned(),
+                    optional,
+                });
+            }
             Ok(())
         };
-        for pattern in workspace_globs {
-            add(
-                &[],
-                pattern,
-                Owner::Workspace,
-                "[workspace.metadata.testcache]",
-            )?;
-        }
+        add(
+            &[],
+            workspace_globs,
+            Owner::Workspace,
+            "[workspace.metadata.testcache]",
+        )?;
         for (index, package) in packages.into_iter().enumerate() {
             package_names.push(package.name.to_owned());
             let target_globs = package
                 .targets
                 .iter()
-                .filter(|(_, target)| !target.inputs.is_empty());
+                .filter(|(_, target)| !Globs::from(*target).is_empty());
             if package.globs.is_empty() && target_globs.clone().next().is_none() {
                 continue;
             }
@@ -202,16 +267,17 @@ impl InputPatterns {
             let dir_components: Vec<&str> =
                 dir.split('/').filter(|part| !part.is_empty()).collect();
             let table = format!("[package.metadata.testcache] of `{}`", package.name);
-            for pattern in package.globs {
-                add(&dir_components, pattern, Owner::Package(index), &table)?;
-            }
+            add(
+                &dir_components,
+                package.globs,
+                Owner::Package(index),
+                &table,
+            )?;
             for (name, target) in target_globs {
                 let owner = Owner::Target(targets.len());
                 targets.push((index, name.clone()));
                 let table = format!("package `{}` target `{name}`", package.name);
-                for pattern in &target.inputs {
-                    add(&dir_components, pattern, owner, &table)?;
-                }
+                add(&dir_components, target.into(), owner, &table)?;
             }
         }
         let set = builder.build().map_err(|source| Error::InvalidGlob {
@@ -303,18 +369,30 @@ impl InputPatterns {
         }
     }
 
-    /// Warns once for each glob that matched no file.
+    /// The required globs that matched no file, as declared.
+    ///
+    /// # Arguments
+    ///
+    /// * `matched` - Whether each glob, by index, matched a file.
+    ///
+    /// # Returns
+    ///
+    /// The declarations to warn about, in declaration order; optional globs are never among them.
+    fn unmatched<'a>(&'a self, matched: &'a [bool]) -> impl Iterator<Item = &'a Declared> {
+        self.declared
+            .iter()
+            .zip(matched)
+            .filter(|(declared, matched)| !declared.optional && !**matched)
+            .map(|(declared, _)| declared)
+    }
+
+    /// Warns once for each required glob that matched no file.
     ///
     /// # Arguments
     ///
     /// * `matched` - Whether each glob, by index, matched a file.
     fn warn_unmatched(&self, matched: &[bool]) {
-        for ((pattern, table), _) in self
-            .declared
-            .iter()
-            .zip(matched)
-            .filter(|(_, matched)| !**matched)
-        {
+        for Declared { pattern, table, .. } in self.unmatched(matched) {
             tracing::warn!("inputs glob {pattern:?} in {table} matched no file");
         }
     }
@@ -652,6 +730,14 @@ mod tests {
     /// No `targets` tables. `BTreeMap::new` is a `const fn`, so it can initialize a `static`.
     static NO_TARGETS: BTreeMap<String, TargetConfig> = BTreeMap::new();
 
+    /// Required globs only.
+    fn required(globs: &[String]) -> Globs<'_> {
+        Globs {
+            required: globs,
+            optional: &[],
+        }
+    }
+
     /// The target of a test binary of a package.
     fn binary(package: &str, kind: TargetKind, name: &str) -> TargetId {
         TargetId {
@@ -683,34 +769,34 @@ mod tests {
     fn patterns_with(a_dir: &str, workspace_globs: &[String]) -> InputPatterns {
         let fixtures = ["fixtures/**".to_owned()];
         InputPatterns::from_parts(
-            workspace_globs,
+            required(workspace_globs),
             [
                 PackageGlobs {
                     id: "a",
                     name: "a",
                     dir: Some(a_dir.to_owned()),
-                    globs: &fixtures,
+                    globs: required(&fixtures),
                     targets: &NO_TARGETS,
                 },
                 PackageGlobs {
                     id: "b",
                     name: "b",
                     dir: Some("crates/b".to_owned()),
-                    globs: &fixtures,
+                    globs: required(&fixtures),
                     targets: &NO_TARGETS,
                 },
                 PackageGlobs {
                     id: "c",
                     name: "c",
                     dir: None,
-                    globs: &fixtures,
+                    globs: required(&fixtures),
                     targets: &NO_TARGETS,
                 },
                 PackageGlobs {
                     id: "d",
                     name: "d",
                     dir: Some("crates/d".to_owned()),
-                    globs: &[],
+                    globs: required(&[]),
                     targets: &NO_TARGETS,
                 },
             ],
@@ -958,12 +1044,12 @@ mod tests {
         assert_eq!(rooted.prefix, expected, "{pattern:?} from {dir:?}");
         let globs = [pattern.clone()];
         let patterns = InputPatterns::from_parts(
-            &[],
+            Globs::default(),
             [PackageGlobs {
                 id: "a",
                 name: "a",
                 dir: Some(dir.join("/")),
-                globs: &globs,
+                globs: required(&globs),
                 targets: &NO_TARGETS,
             }],
         )
@@ -990,12 +1076,12 @@ mod tests {
         };
 
         let compiled = InputPatterns::from_parts(
-            workspace_globs,
+            required(workspace_globs),
             [PackageGlobs {
                 id: "a",
                 name: "a",
                 dir: Some("crates/a".to_owned()),
-                globs: package_globs,
+                globs: required(package_globs),
                 targets: &NO_TARGETS,
             }],
         );
@@ -1013,7 +1099,7 @@ mod tests {
     fn target_patterns() -> InputPatterns {
         let table = |inputs: &[&str]| TargetConfig {
             inputs: inputs.iter().map(|glob| (*glob).to_owned()).collect(),
-            spawns: Vec::new(),
+            ..TargetConfig::default()
         };
         let a_targets = BTreeMap::from([
             (
@@ -1027,27 +1113,27 @@ mod tests {
         let c_targets = BTreeMap::from([("t".to_owned(), table(&["x/**"]))]);
         let fixtures = ["fixtures/**".to_owned()];
         InputPatterns::from_parts(
-            &["data/**".to_owned(), "**/shared.txt".to_owned()],
+            required(&["data/**".to_owned(), "**/shared.txt".to_owned()]),
             [
                 PackageGlobs {
                     id: "a",
                     name: "a",
                     dir: Some("crates/a".to_owned()),
-                    globs: &fixtures,
+                    globs: required(&fixtures),
                     targets: &a_targets,
                 },
                 PackageGlobs {
                     id: "b",
                     name: "b",
                     dir: Some("crates/b".to_owned()),
-                    globs: &[],
+                    globs: required(&[]),
                     targets: &b_targets,
                 },
                 PackageGlobs {
                     id: "c",
                     name: "c",
                     dir: None,
-                    globs: &[],
+                    globs: required(&[]),
                     targets: &c_targets,
                 },
             ],
@@ -1132,10 +1218,88 @@ mod tests {
             ]
         );
         assert!(index.for_binary(&binary("c", other_kind, "t")).is_err());
-        assert!(index.patterns.declared.contains(&(
-            "migrations/**".to_owned(),
-            "package `a` target `migrate`".to_owned()
-        )));
+        assert!(index.patterns.declared.contains(&Declared {
+            pattern: "migrations/**".to_owned(),
+            table: "package `a` target `migrate`".to_owned(),
+            optional: false,
+        }));
+    }
+
+    // Property: of the globs that matched no file, exactly the required ones are warned about,
+    // at every level and in declaration order; an optional glob is never warned about, and
+    // still owns the files it matches, so a present optional file is an input.
+    #[hegel::test]
+    fn only_required_globs_that_match_nothing_are_warned_about(tc: TestCase) {
+        // Each table's globs are drawn as required or optional; each name is distinct, so a
+        // glob matches only the file of its own name.
+        let draw_split = |prefix: &str| {
+            let names: Vec<String> = (0..3).map(|index| format!("{prefix}{index}")).collect();
+            let (optional, required): (Vec<String>, Vec<String>) =
+                names.into_iter().partition(|_| tc.draw(gs::booleans()));
+            (required, optional)
+        };
+        let workspace = draw_split("w");
+        let package = draw_split("p");
+        let target = draw_split("t");
+        let targets = BTreeMap::from([(
+            "lib".to_owned(),
+            TargetConfig {
+                inputs: target.0.clone(),
+                optional_inputs: target.1.clone(),
+                ..TargetConfig::default()
+            },
+        )]);
+        let globs = |(required, optional): &(Vec<String>, Vec<String>)| -> Vec<String> {
+            required.iter().chain(optional).cloned().collect()
+        };
+        let declared_names: Vec<String> = [&workspace, &package, &target]
+            .into_iter()
+            .flat_map(globs)
+            .collect();
+        let patterns = InputPatterns::from_parts(
+            Globs {
+                required: &workspace.0,
+                optional: &workspace.1,
+            },
+            [PackageGlobs {
+                id: "a",
+                name: "a",
+                dir: Some(String::new()),
+                globs: Globs {
+                    required: &package.0,
+                    optional: &package.1,
+                },
+                targets: &targets,
+            }],
+        )
+        .expect("valid globs");
+        let matched: Vec<bool> = declared_names
+            .iter()
+            .map(|_| tc.draw(gs::booleans()))
+            .collect();
+
+        let warned: Vec<&str> = patterns
+            .unmatched(&matched)
+            .map(|declared| declared.pattern.as_str())
+            .collect();
+
+        let optional_names: Vec<&String> = [&workspace.1, &package.1, &target.1]
+            .into_iter()
+            .flatten()
+            .collect();
+        let expected: Vec<&str> = declared_names
+            .iter()
+            .zip(&matched)
+            .filter(|(name, matched)| !**matched && !optional_names.contains(name))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(warned, expected, "matched {matched:?}");
+        for name in optional_names {
+            assert!(
+                !patterns.owners_of(name).is_empty(),
+                "{name} is still an input"
+            );
+        }
     }
 
     // Property: the levels declaring a path for a binary are those whose globs match it now

@@ -3,15 +3,18 @@
 //! ```toml
 //! [workspace.metadata.testcache]
 //! inputs = ["migrations/**"]     # files tests read at runtime
+//! optional_inputs = [".env"]     # the same, but a glob that matches nothing is not warned about
 //! env = ["DATABASE_IMAGE"]       # variables whose values are part of every key
 //! always_run = ["*/live_*"]      # "package/target" patterns that are never skipped
 //! spawns = ["myapp-server"]      # binaries spawned by path, relative to target/<profile>
 //! ```
 //!
-//! A package's table uses the same keys and adds to the workspace's. Its `inputs` are relative
-//! to the package's directory; the workspace's to the workspace root.
+//! A package's table uses the same keys and adds to the workspace's. Its `inputs` and
+//! `optional_inputs` are relative to the package's directory; the workspace's to the workspace
+//! root.
 //!
-//! A package's table may also narrow `inputs` and `spawns` to some of its test targets:
+//! A package's table may also narrow `inputs`, `optional_inputs` and `spawns` to some of its
+//! test targets:
 //!
 //! ```toml
 //! [package.metadata.testcache.targets.migrate]   # integration test `tests/migrate.rs`
@@ -20,9 +23,9 @@
 //! ```
 //!
 //! A `targets.<name>` table applies to every test binary of the package whose target is named
-//! `<name>`, whatever its kind; `lib` also names the package's library. It holds only `inputs`
-//! and `spawns`: `env` and `always_run` stay package-wide. The workspace's table has no
-//! `targets`.
+//! `<name>`, whatever its kind; `lib` also names the package's library. It holds only `inputs`,
+//! `optional_inputs` and `spawns`: `env` and `always_run` stay package-wide. The workspace's
+//! table has no `targets`.
 
 use std::collections::BTreeMap;
 
@@ -53,13 +56,16 @@ pub const WORKSPACE_LOCATION: &str = "[workspace.metadata]";
 pub struct TestcacheConfig {
     /// Globs of files that tests read at runtime.
     pub inputs: Vec<String>,
+    /// Globs like `inputs` for files that may be absent: one that matches nothing is expected.
+    pub optional_inputs: Vec<String>,
     /// Environment variables whose values are part of the key.
     pub env: Vec<String>,
     /// `package/target` patterns that always run.
     pub always_run: Vec<String>,
     /// Paths, relative to the target profile directory, of binaries tests spawn.
     pub spawns: Vec<String>,
-    /// Per-target `inputs` and `spawns`, by target name; only in a package's table.
+    /// Per-target `inputs`, `optional_inputs` and `spawns`, by target name; only in a package's
+    /// table.
     // A `BTreeMap` iterates in key order, so the targets' spawns enter a key in a fixed order.
     pub targets: BTreeMap<String, TargetConfig>,
 }
@@ -72,6 +78,8 @@ pub struct TestcacheConfig {
 pub struct TargetConfig {
     /// Globs of files the target's tests read, relative to the package directory.
     pub inputs: Vec<String>,
+    /// Globs like `inputs` for files that may be absent.
+    pub optional_inputs: Vec<String>,
     /// Paths, relative to the target profile directory, of binaries the target's tests spawn.
     pub spawns: Vec<String>,
 }
@@ -252,10 +260,17 @@ mod tests {
     use hegel::generators::{self as gs, Generator};
     use serde_json::json;
 
-    const KEYS: [&str; 5] = ["inputs", "env", "always_run", "spawns", "targets"];
+    const KEYS: [&str; 6] = [
+        "inputs",
+        "optional_inputs",
+        "env",
+        "always_run",
+        "spawns",
+        "targets",
+    ];
 
     /// The keys a `targets.<name>` table may have.
-    const TARGET_KEYS: [&str; 2] = ["inputs", "spawns"];
+    const TARGET_KEYS: [&str; 3] = ["inputs", "optional_inputs", "spawns"];
 
     fn draw_list(tc: &TestCase) -> Vec<String> {
         tc.draw(gs::vecs(gs::text().max_size(10)).max_size(3))
@@ -273,6 +288,7 @@ mod tests {
             .map(|name| {
                 let table = TargetConfig {
                     inputs: draw_list(tc),
+                    optional_inputs: draw_list(tc),
                     spawns: draw_list(tc),
                 };
                 (name, table)
@@ -286,7 +302,11 @@ mod tests {
             targets
                 .iter()
                 .map(|(name, table)| {
-                    let value = json!({ "inputs": table.inputs, "spawns": table.spawns });
+                    let value = json!({
+                        "inputs": table.inputs,
+                        "optional_inputs": table.optional_inputs,
+                        "spawns": table.spawns,
+                    });
                     (name.clone(), value)
                 })
                 .collect(),
@@ -298,13 +318,14 @@ mod tests {
     fn tables_are_read_as_written(tc: TestCase) {
         let config = TestcacheConfig {
             inputs: draw_list(&tc),
+            optional_inputs: draw_list(&tc),
             env: draw_list(&tc),
             always_run: draw_list(&tc),
             spawns: draw_list(&tc),
             targets: draw_targets(&tc),
         };
         let metadata = json!({ "other": 1, "testcache": {
-            "inputs": config.inputs, "env": config.env,
+            "inputs": config.inputs, "optional_inputs": config.optional_inputs, "env": config.env,
             "always_run": config.always_run, "spawns": config.spawns,
             "targets": targets_json(&config.targets),
         }});
@@ -390,8 +411,8 @@ mod tests {
         assert!(matcher.matches(&package, &format!("live_{target}")));
         assert!(!matcher.matches(&format!("{package}/live_x"), "y"));
     }
-    // Property: a target table holds only `inputs` and `spawns`; any other key, `env` and
-    // `always_run` included, is an error that names the package table it is in.
+    // Property: a target table holds only `inputs`, `optional_inputs` and `spawns`; any other
+    // key, `env` and `always_run` included, is an error that names the package table it is in.
     #[hegel::test]
     fn target_tables_refuse_other_keys(tc: TestCase) {
         let location = draw_name(&tc);
@@ -407,7 +428,7 @@ mod tests {
         let metadata = json!({ "testcache": { "targets": targets } });
 
         let error = TestcacheConfig::from_metadata(Some(&metadata), &location)
-            .expect_err("only inputs and spawns are allowed in a target table");
+            .expect_err("only inputs, optional_inputs and spawns are allowed in a target table");
 
         assert!(
             matches!(&error, Error::InvalidManifest { location: at, .. } if *at == location),

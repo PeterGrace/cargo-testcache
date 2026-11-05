@@ -512,7 +512,8 @@ fn via_cargo_records_only_the_binary_it_hashed(tc: TestCase) {
 // directories with `./`, and still covers the files it names: with only alpha's table naming
 // `data/`, changing `data/value.txt` reruns alpha's binaries and no other, and so does changing
 // alpha's fixture. Every spelling is checked in every case, in turn on one fixture, in a drawn
-// order. A glob that matches no file is warned about.
+// order. A glob that matches no file is warned about, unless it is in `optional_inputs`; an
+// optional file appearing, and then disappearing, each rerun alpha's binaries.
 #[hegel::test(test_cases = 2)]
 fn package_inputs_may_climb_out_of_the_package(tc: TestCase) {
     let rotation = tc.draw(gs::integers::<usize>().max_value(2));
@@ -555,6 +556,39 @@ fn package_inputs_may_climb_out_of_the_package(tc: TestCase) {
         stderr(&output).contains(
             "inputs glob \"nothing/**\" in [package.metadata.testcache] of `alpha` matched no file"
         ),
+        "{}",
+        stderr(&output)
+    );
+
+    // The same glob as an optional input is silent, and the absent file is still keyed on.
+    fixture.replace(
+        "alpha/Cargo.toml",
+        "inputs = [\"nothing/**\"]",
+        "optional_inputs = [\"../absent.env\"]",
+    );
+    let output = fixture.testcache_ok(&[]);
+    assert!(
+        !stderr(&output).contains("matched no file"),
+        "{}",
+        stderr(&output)
+    );
+    fixture.take_runs();
+    fixture.write("absent.env", &stamp.to_string());
+    fixture.testcache_ok(&[]);
+    assert_eq!(
+        fixture.take_runs(),
+        names(&["alpha", "reads_input"]),
+        "after the optional file appears"
+    );
+    fs::remove_file(fixture.root.join("absent.env")).expect("remove the optional file");
+    let output = fixture.testcache_ok(&[]);
+    assert_eq!(
+        fixture.take_runs(),
+        names(&["alpha", "reads_input"]),
+        "after the optional file disappears"
+    );
+    assert!(
+        !stderr(&output).contains("matched no file"),
         "{}",
         stderr(&output)
     );

@@ -12,6 +12,7 @@ Failures are never cached. The design is in
 cargo install --path crates/cargo-testcache
 cargo testcache [OPTIONS] [CARGO TEST ARGS] [-- TEST BINARY ARGS]
 cargo testcache status [CARGO TEST ARGS]     # what would run, and why; runs nothing
+                                             # (it may update hashes.json, see below)
 cargo testcache clear                        # forget every recorded pass
 ```
 
@@ -107,7 +108,7 @@ modified within 2 seconds of being checked is hashed again on the next run (git'
 so a binary is first remembered when it is checked at least 2 seconds after it was linked. The
 remaining risk is a file rewritten in place with every one of those fields unchanged, or a
 network filesystem whose clock lags by more than 2 seconds; `--no-stat-cache` hashes everything
-in full.
+in full. `status` saves the digests it computes as well, though it records no passes.
 
 The record lives in `<target-dir>/testcache/passes.jsonl`; `cargo clean` removes it too. Keep a
 plain `cargo test` in CI: the cache is for local iteration.

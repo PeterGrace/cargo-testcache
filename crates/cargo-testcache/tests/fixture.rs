@@ -826,7 +826,7 @@ fn remembered_digests_replace_hashing_unless_turned_off(tc: TestCase) {
     );
 }
 
-// Property (9.8): `status` runs nothing and records nothing, and `clear` forgets every pass.
+// Property (9.8): `status` runs nothing and records no passes, and `clear` forgets every pass.
 // Checked before and after a recorded run in every case, each on a fresh fixture, in a drawn
 // order.
 #[hegel::test(test_cases = 2)]

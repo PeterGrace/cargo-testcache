@@ -308,6 +308,8 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
 
+    // Only the Unix-only tests below plant digests.
+    #[cfg(unix)]
     use crate::key::testing::draw_digest;
 
     /// Well after any file a test writes now: its times have settled by then.
@@ -365,6 +367,8 @@ mod tests {
 
     // Property: a file whose times have settled is remembered with its true digest, and that
     // digest is reused, without reading the file, while its metadata is unchanged.
+    // Unix only: elsewhere `FileStat::of` gives `None`, so nothing is remembered to reuse.
+    #[cfg(unix)]
     #[hegel::test]
     fn a_settled_digest_is_reused_while_the_metadata_matches(tc: TestCase) {
         let contents = tc.draw(gs::binary().max_size(64));
@@ -392,6 +396,8 @@ mod tests {
 
     // Property: a file whose metadata differs from the remembered entry, or any file when
     // reuse is off, is hashed again and gets its true digest.
+    // Unix only: elsewhere `FileStat::of` gives `None`, so nothing is remembered to reuse.
+    #[cfg(unix)]
     #[hegel::test]
     fn changed_metadata_or_no_reuse_hashes_again(tc: TestCase) {
         let contents = tc.draw(gs::binary().max_size(64));
@@ -400,7 +406,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = write(dir.path(), "bin", &contents);
         let mut cache = HashCache::load(dir.path(), reuse);
-        let stat = FileStat::of(&fs::metadata(&path).expect("metadata")).expect("unix");
+        let stat = FileStat::of(&fs::metadata(&path).expect("metadata"))
+            .expect("stat fields exist on Unix");
         let differs = tc.draw(gs::booleans());
         let remembered = if differs {
             FileStat {
